@@ -1,0 +1,574 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::Response;
+use axum::Json;
+use http_body::Frame;
+use serde_json::Value;
+
+use crate::backends;
+use crate::backends::TokenUsage;
+use crate::config::{BackendConfig, BackendType, ModelConfig};
+use crate::error::ProxyError;
+use crate::rate_limiter::RateLimitResult;
+use crate::server::AppState;
+use crate::vram::coordinator::{AcquireResult, Priority, VramCoordinator};
+
+/// Active route after VRAM acquire + possible fallback resolution.
+/// Replaces the fragile 6-tuple with named fields.
+struct ActiveRoute {
+    model_name: String,
+    model_key: String,
+    model_config: ModelConfig,
+    backend_config: BackendConfig,
+    backend_name: String,
+    is_local: bool,
+    estimated_vram: u64,
+}
+
+/// POST /v1/chat/completions
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Result<Response, ProxyError> {
+    // ── Required field validation ──
+    let model_name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ProxyError::BadRequest("Missing 'model' field".into()))?
+        .to_string();
+
+    let messages = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ProxyError::BadRequest("Missing 'messages' array".into()))?;
+
+    if messages.is_empty() {
+        return Err(ProxyError::BadRequest("'messages' array is empty".into()));
+    }
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(|v| v.as_str()).is_none() {
+            return Err(ProxyError::BadRequest(format!(
+                "Message at index {} is missing 'role' field",
+                i
+            )));
+        }
+    }
+
+    // ── Optional field validation ──
+    if let Some(n) = body.get("n").and_then(|v| v.as_u64()) {
+        if n > 1 {
+            return Err(ProxyError::BadRequest(
+                "'n' > 1 is not supported (proxy does not support multiple completions)".into(),
+            ));
+        }
+    }
+
+    if let Some(temp) = body.get("temperature").and_then(|v| v.as_f64()) {
+        if !(0.0..=2.0).contains(&temp) {
+            return Err(ProxyError::BadRequest(format!(
+                "'temperature' must be between 0.0 and 2.0, got {}",
+                temp
+            )));
+        }
+    }
+
+    if let Some(top_p) = body.get("top_p").and_then(|v| v.as_f64()) {
+        if !(0.0..=1.0).contains(&top_p) {
+            return Err(ProxyError::BadRequest(format!(
+                "'top_p' must be between 0.0 and 1.0, got {}",
+                top_p
+            )));
+        }
+    }
+
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ── Model resolution ──
+    let (model_key, model_config, backend_config) = state
+        .config
+        .resolve_model(&model_name)
+        .ok_or_else(|| ProxyError::UnknownModel(model_name.clone()))?;
+
+    // ── Privacy check (case-insensitive to prevent bypass) ──
+    let privacy_header = &state.config.routing.privacy_header;
+    let local_only = headers
+        .get(privacy_header)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("local_only"))
+        .unwrap_or(false);
+
+    if local_only && backend_config.backend_type == BackendType::Remote {
+        return Err(ProxyError::PrivacyViolation(model_name));
+    }
+
+    // ── Priority: header override > model default > Medium ──
+    let priority_header = &state.config.routing.priority_header;
+    let priority = headers
+        .get(priority_header)
+        .and_then(|v| v.to_str().ok())
+        .map(Priority::from_str)
+        .or_else(|| model_config.default_priority.as_deref().map(Priority::from_str))
+        .unwrap_or(Priority::Medium);
+
+    // Clone to owned values for the rest of the handler
+    let original_backend_name = model_config.backend.clone();
+    let model_key_owned = model_key.to_string();
+    let model_config = model_config.clone();
+    let backend_config = backend_config.clone();
+    let estimated_vram = model_config.estimated_vram_mb.unwrap_or(0);
+
+    let start = Instant::now();
+
+    tracing::info!(
+        model = %model_name,
+        stream = stream,
+        backend = %original_backend_name,
+        messages = messages.len(),
+        priority = ?priority,
+        local_only = local_only,
+        "Chat completion request"
+    );
+
+    state.stats.increment_requests();
+
+    // ── Circuit breaker check on ORIGINAL backend (BEFORE VRAM acquire to avoid wasted acquire+demote) ──
+    if !state.circuit_breaker.allow_request(&original_backend_name) {
+        tracing::warn!(
+            backend = %original_backend_name,
+            model = %model_name,
+            "Circuit breaker open — rejecting request"
+        );
+        state.metrics.record_circuit_breaker_trip(&original_backend_name);
+        return Err(ProxyError::BackendUnavailable(format!(
+            "Backend '{}' circuit breaker is open (too many consecutive failures)",
+            original_backend_name
+        )));
+    }
+
+    // ── VRAM acquire (local backends only) — with fallback ──
+    let is_local = backend_config.backend_type == BackendType::Local;
+    let active = if is_local && estimated_vram > 0 {
+        match state
+            .vram
+            .acquire(&state.client, &model_name, priority, estimated_vram)
+            .await
+        {
+            AcquireResult::Acquired => ActiveRoute {
+                model_name: model_name.clone(),
+                model_key: model_key_owned.clone(),
+                model_config: model_config.clone(),
+                backend_config: backend_config.clone(),
+                backend_name: original_backend_name.clone(),
+                is_local: true,
+                estimated_vram,
+            },
+            AcquireResult::InsufficientVram { needed_mb, available_mb }
+                if !local_only =>
+            {
+                try_fallback(
+                    &state, &model_config, &model_key_owned, &model_name,
+                    local_only, needed_mb, available_mb,
+                )?
+            }
+            AcquireResult::EvictionFailed(_) if !local_only => {
+                let budget = state.vram.budget_summary();
+                try_fallback(
+                    &state, &model_config, &model_key_owned, &model_name,
+                    local_only, estimated_vram, budget.available_mb,
+                )?
+            }
+            AcquireResult::InsufficientVram { needed_mb, available_mb } => {
+                return Err(ProxyError::BackendUnavailable(format!(
+                    "Insufficient VRAM: need {} MB, only {} MB available (local_only, no fallback)",
+                    needed_mb, available_mb
+                )));
+            }
+            AcquireResult::EvictionFailed(e) => {
+                return Err(ProxyError::BackendUnavailable(format!(
+                    "VRAM eviction failed: {} (local_only, no fallback)",
+                    e
+                )));
+            }
+        }
+    } else {
+        ActiveRoute {
+            model_name: model_name.clone(),
+            model_key: model_key_owned.clone(),
+            model_config: model_config.clone(),
+            backend_config: backend_config.clone(),
+            backend_name: original_backend_name.clone(),
+            is_local,
+            estimated_vram,
+        }
+    };
+
+    // ── Circuit breaker check on ACTIVE backend (only needed if fallback changed the backend) ──
+    if active.backend_name != original_backend_name
+        && !state.circuit_breaker.allow_request(&active.backend_name)
+    {
+        tracing::warn!(
+            backend = %active.backend_name,
+            model = %active.model_name,
+            "Circuit breaker open on fallback backend — rejecting request"
+        );
+        state.metrics.record_circuit_breaker_trip(&active.backend_name);
+        // Demote VRAM if we already acquired (fallback to local scenario)
+        if active.is_local && active.estimated_vram > 0 {
+            state.vram.demote_to_idle(&active.model_name);
+        }
+        return Err(ProxyError::BackendUnavailable(format!(
+            "Backend '{}' circuit breaker is open (too many consecutive failures)",
+            active.backend_name
+        )));
+    }
+
+    // ── Rate limit check (after CB + VRAM, so no phantom consumption on rejected requests) ──
+    if let RateLimitResult::Denied { retry_after_secs } = state.rate_limiter.check(&active.model_key) {
+        // Demote VRAM if we already acquired
+        if active.is_local && active.estimated_vram > 0 {
+            state.vram.demote_to_idle(&active.model_name);
+        }
+        tracing::warn!(
+            model = %active.model_name,
+            retry_after_secs = retry_after_secs,
+            "Rate limit exceeded"
+        );
+        return Err(ProxyError::RateLimited { retry_after_secs });
+    }
+
+    // ── Inject model defaults (extra_body) from the ACTIVE model config ──
+    active.model_config.apply_extra_body(&mut body);
+
+    // If we fell back to a different model, update the model name in the body
+    if active.model_name != model_name {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), Value::String(active.model_name.clone()));
+        }
+    }
+
+    // ── Extract max_tokens before dispatch (for streaming TPM estimation) ──
+    let request_max_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4096);
+
+    // ── Forward to backend ──
+    let retry_result = backends::dispatch_chat(&state.client, &active.backend_config, body, stream).await;
+    let result = retry_result.result;
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    // ── Circuit breaker feedback (on the ACTIVE backend) ──
+    // Record each failed retry attempt as a separate failure
+    for _ in 0..retry_result.failed_attempts {
+        state.circuit_breaker.record_failure(&active.backend_name);
+    }
+    // Record the final result
+    match &result {
+        Ok(resp) if resp.status().is_success() => {
+            state.circuit_breaker.record_success(&active.backend_name);
+        }
+        // 4xx: neutral — don't reset consecutive_failures (prevents CB bypass via crafted 400s)
+        Ok(resp) if resp.status().is_server_error() => {
+            state.circuit_breaker.record_failure(&active.backend_name);
+        }
+        Err(_) => {
+            state.circuit_breaker.record_failure(&active.backend_name);
+        }
+        _ => {}
+    }
+
+    // ── Token usage + metrics reporting (using ACTIVE model key) ──
+    if let Ok(ref resp) = result {
+        if !stream {
+            // Non-streaming: exact token count from response extension
+            if let Some(usage) = resp.extensions().get::<TokenUsage>() {
+                state.rate_limiter.report_tokens(&active.model_key, usage.total_tokens);
+                state.metrics.record_tokens(&active.model_name, usage.prompt_tokens, usage.completion_tokens);
+            }
+        } else {
+            // Streaming: pre-deduct estimated tokens from TPM to prevent bypass.
+            // Uses max_tokens from request (or default 4096) as conservative estimate.
+            state.rate_limiter.report_tokens(&active.model_key, request_max_tokens);
+        }
+    }
+
+    // ── Metrics: request + backend (using ACTIVE names) ──
+    {
+        let is_error = result.as_ref().map_or(true, |r| !r.status().is_success());
+        state.metrics.record_request(&active.model_name, latency_ms, is_error, stream);
+        let (status_code, is_conn_err) = match &result {
+            Ok(resp) => (Some(resp.status().as_u16()), false),
+            Err(_) => (None, true),
+        };
+        state.metrics.record_backend_request(&active.backend_name, status_code, is_conn_err);
+    }
+
+    // ── Demote to idle after completion (local backends only) ──
+    if active.is_local && active.estimated_vram > 0 {
+        if stream {
+            match result {
+                Ok(response) => {
+                    // Streaming OK: wrap the response body so demote happens when the stream ends (Drop)
+                    let (parts, body) = response.into_parts();
+                    let wrapped = DemoteOnDropBody::new(body, state.vram.clone(), active.model_name.clone());
+                    let response = Response::from_parts(parts, Body::new(wrapped));
+
+                    tracing::info!(
+                        model = %active.model_name,
+                        original_model = %model_name,
+                        backend = %active.backend_name,
+                        stream = true,
+                        status = response.status().as_u16(),
+                        latency_ms = latency_ms,
+                        "Chat completion streaming started"
+                    );
+
+                    return Ok(response);
+                }
+                Err(e) => {
+                    // Streaming Err: demote immediately since DemoteOnDropBody won't be created
+                    state.vram.demote_to_idle(&active.model_name);
+                    tracing::warn!(
+                        model = %active.model_name,
+                        original_model = %model_name,
+                        backend = %active.backend_name,
+                        stream = true,
+                        latency_ms = latency_ms,
+                        error = %e,
+                        "Chat completion failed (streaming)"
+                    );
+                    return Err(e);
+                }
+            }
+        } else {
+            state.vram.demote_to_idle(&active.model_name);
+        }
+    }
+
+    match &result {
+        Ok(resp) => {
+            tracing::info!(
+                model = %active.model_name,
+                original_model = %model_name,
+                backend = %active.backend_name,
+                stream = stream,
+                status = resp.status().as_u16(),
+                latency_ms = latency_ms,
+                "Chat completion completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                model = %active.model_name,
+                original_model = %model_name,
+                backend = %active.backend_name,
+                stream = stream,
+                latency_ms = latency_ms,
+                error = %e,
+                "Chat completion failed"
+            );
+        }
+    }
+
+    result
+}
+
+/// Result of a successful fallback resolution
+struct FallbackResult {
+    model_name: String,
+    model_key: String,
+    model_config: ModelConfig,
+    backend_config: BackendConfig,
+    backend_name: String,
+}
+
+/// Try to fall back to a remote model when local VRAM is insufficient.
+/// Returns the full fallback model config, backend config, and names,
+/// or an error if fallback is not possible.
+fn try_fallback(
+    state: &AppState,
+    model_config: &ModelConfig,
+    original_model_key: &str,
+    original_model: &str,
+    local_only: bool,
+    needed_mb: u64,
+    available_mb: u64,
+) -> Result<ActiveRoute, ProxyError> {
+    if local_only {
+        return Err(ProxyError::BackendUnavailable(format!(
+            "Insufficient VRAM: need {} MB, only {} MB available (local_only, no fallback)",
+            needed_mb, available_mb
+        )));
+    }
+
+    // Check if model has explicit fallback configured
+    let fb = match &model_config.fallback {
+        Some(key) => resolve_fallback(state, key, original_model, needed_mb, available_mb)?,
+        None => {
+            // No explicit fallback — check default_fallback policy
+            if state.config.routing.default_fallback == "remote" {
+                // Auto-select first available remote model
+                auto_select_remote_fallback(state, original_model_key, original_model, needed_mb, available_mb)?
+            } else {
+                // "deny" or unknown policy
+                return Err(ProxyError::BackendUnavailable(format!(
+                    "Insufficient VRAM: need {} MB, only {} MB available (no fallback configured)",
+                    needed_mb, available_mb
+                )));
+            }
+        }
+    };
+
+    // Warn if fallback is also local (no VRAM acquire will happen for it)
+    if fb.backend_config.backend_type == BackendType::Local {
+        tracing::warn!(
+            original_model = %original_model,
+            fallback_model = %fb.model_name,
+            "Fallback model is also local — no VRAM acquire for fallback, OOM risk"
+        );
+    }
+
+    let fb_is_local = fb.backend_config.backend_type == BackendType::Local;
+    let fb_vram = fb.model_config.estimated_vram_mb.unwrap_or(0);
+
+    Ok(ActiveRoute {
+        model_name: fb.model_name,
+        model_key: fb.model_key,
+        model_config: fb.model_config,
+        backend_config: fb.backend_config,
+        backend_name: fb.backend_name,
+        is_local: fb_is_local,
+        estimated_vram: fb_vram,
+    })
+}
+
+/// Resolve an explicit fallback model by config key
+fn resolve_fallback(
+    state: &AppState,
+    fallback_key: &str,
+    original_model: &str,
+    needed_mb: u64,
+    available_mb: u64,
+) -> Result<FallbackResult, ProxyError> {
+    let (_, fallback_model, fallback_backend) = state
+        .config
+        .resolve_model_by_key(fallback_key)
+        .ok_or_else(|| {
+            ProxyError::BackendNotConfigured(format!(
+                "Fallback model '{}' not found",
+                fallback_key
+            ))
+        })?;
+
+    tracing::warn!(
+        original_model = %original_model,
+        fallback_model = %fallback_model.name,
+        fallback_backend = %fallback_model.backend,
+        needed_mb = needed_mb,
+        available_mb = available_mb,
+        "VRAM insufficient — falling back"
+    );
+
+    Ok(FallbackResult {
+        model_name: fallback_model.name.clone(),
+        model_key: fallback_key.to_string(),
+        model_config: fallback_model.clone(),
+        backend_config: fallback_backend.clone(),
+        backend_name: fallback_model.backend.clone(),
+    })
+}
+
+/// Auto-select a remote model when default_fallback == "remote" and no explicit fallback is set.
+fn auto_select_remote_fallback(
+    state: &AppState,
+    original_model_key: &str,
+    original_model: &str,
+    needed_mb: u64,
+    available_mb: u64,
+) -> Result<FallbackResult, ProxyError> {
+    for (key, model) in &state.config.models {
+        if key == original_model_key {
+            continue;
+        }
+        if let Some(backend) = state.config.backends.get(&model.backend) {
+            if backend.backend_type == BackendType::Remote {
+                tracing::warn!(
+                    original_model = %original_model,
+                    fallback_model = %model.name,
+                    fallback_backend = %model.backend,
+                    needed_mb = needed_mb,
+                    available_mb = available_mb,
+                    "VRAM insufficient — auto-fallback to remote (default_fallback=remote)"
+                );
+                return Ok(FallbackResult {
+                    model_name: model.name.clone(),
+                    model_key: key.clone(),
+                    model_config: model.clone(),
+                    backend_config: backend.clone(),
+                    backend_name: model.backend.clone(),
+                });
+            }
+        }
+    }
+
+    Err(ProxyError::BackendUnavailable(format!(
+        "Insufficient VRAM: need {} MB, only {} MB available (default_fallback=remote but no remote model configured)",
+        needed_mb, available_mb
+    )))
+}
+
+/// Body wrapper that demotes a model to Idle priority when the stream ends (Drop).
+/// Prevents models from staying at high priority forever after streaming requests.
+struct DemoteOnDropBody {
+    inner: Body,
+    vram: Arc<VramCoordinator>,
+    model: String,
+}
+
+impl DemoteOnDropBody {
+    fn new(inner: Body, vram: Arc<VramCoordinator>, model: String) -> Self {
+        Self { inner, vram, model }
+    }
+}
+
+impl http_body::Body for DemoteOnDropBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // SAFETY: we only pin-project to `inner`, which is Unpin (axum::body::Body is Unpin)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for DemoteOnDropBody {
+    fn drop(&mut self) {
+        tracing::debug!(model = %self.model, "Stream ended — demoting to IDLE");
+        self.vram.demote_to_idle(&self.model);
+    }
+}

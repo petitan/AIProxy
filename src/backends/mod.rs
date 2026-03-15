@@ -1,0 +1,129 @@
+pub mod anthropic;
+pub mod ollama;
+
+use axum::http::StatusCode;
+use axum::response::Response;
+use reqwest::Client;
+
+use crate::config::{ApiFormat, BackendConfig};
+use crate::error::ProxyError;
+
+/// Token usage extracted from backend responses (non-streaming only).
+/// Attached as a response extension for post-request token rate limiting.
+#[derive(Debug, Clone)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Dispatch a chat completion request to the appropriate backend.
+/// Non-streaming requests are retried on transient errors (429, 500, 502, 503, 529).
+/// Returns RetryResult with failed_attempts count for circuit breaker feedback.
+pub async fn dispatch_chat(
+    client: &Client,
+    backend: &BackendConfig,
+    body: serde_json::Value,
+    stream: bool,
+) -> RetryResult {
+    let max_retries = if stream { 0 } else { backend.effective_max_retries() };
+
+    with_retry(max_retries, &backend.base_url, || async {
+        match backend.format {
+            ApiFormat::OpenAI => ollama::chat_completions(client, backend, body.clone(), stream).await,
+            ApiFormat::Anthropic => anthropic::chat_completions(client, backend, body.clone(), stream).await,
+        }
+    }).await
+}
+
+/// Dispatch an embeddings request (only OpenAI-compatible backends).
+/// Returns RetryResult with failed_attempts count for circuit breaker feedback.
+pub async fn dispatch_embeddings(
+    client: &Client,
+    backend: &BackendConfig,
+    body: serde_json::Value,
+) -> RetryResult {
+    let max_retries = backend.effective_max_retries();
+
+    with_retry(max_retries, &backend.base_url, || async {
+        match backend.format {
+            ApiFormat::OpenAI => ollama::embeddings(client, backend, body.clone()).await,
+            ApiFormat::Anthropic => Err(ProxyError::BadRequest(
+                "Anthropic does not support embeddings endpoint".to_string(),
+            )),
+        }
+    }).await
+}
+
+/// Transient HTTP status codes worth retrying
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        429 | 500 | 502 | 503 | 529
+    )
+}
+
+/// Check if a response is retryable (transient error status)
+fn should_retry(result: &Result<Response, ProxyError>) -> bool {
+    match result {
+        Ok(resp) => is_retryable_status(resp.status()),
+        Err(ProxyError::BackendUnavailable(_)) => true, // connection errors, timeouts
+        _ => false,
+    }
+}
+
+/// Result of a retried request, including how many failed attempts occurred.
+pub struct RetryResult {
+    pub result: Result<Response, ProxyError>,
+    /// Number of failed attempts (0 = first attempt succeeded or no retries configured)
+    pub failed_attempts: u32,
+}
+
+/// Retry wrapper with exponential backoff (1s, 2s, 4s, ...)
+async fn with_retry<F, Fut>(
+    max_retries: u32,
+    backend_url: &str,
+    f: F,
+) -> RetryResult
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Response, ProxyError>>,
+{
+    let mut last_result = f().await;
+    let mut failed_attempts: u32 = 0;
+
+    for attempt in 1..=max_retries {
+        if !should_retry(&last_result) {
+            return RetryResult { result: last_result, failed_attempts };
+        }
+
+        failed_attempts += 1;
+
+        let delay = std::time::Duration::from_secs(1 << (attempt - 1).min(3)); // 1s, 2s, 4s, cap at 8s
+
+        let status_info = match &last_result {
+            Ok(resp) => format!("HTTP {}", resp.status()),
+            Err(e) => format!("{}", e),
+        };
+
+        tracing::warn!(
+            backend = %backend_url,
+            attempt = attempt,
+            max_retries = max_retries,
+            error = %status_info,
+            delay_ms = delay.as_millis() as u64,
+            "Retrying request"
+        );
+
+        tokio::time::sleep(delay).await;
+        last_result = f().await;
+    }
+
+    // If we exhausted all retries, the last attempt also failed
+    if should_retry(&last_result) {
+        failed_attempts += 1;
+    }
+
+    RetryResult { result: last_result, failed_attempts }
+}
+

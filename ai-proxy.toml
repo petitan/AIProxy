@@ -1,0 +1,75 @@
+[proxy]
+listen = "127.0.0.1:8800"
+log_level = "info"
+# api_key_env = "AI_PROXY_KEY"  # Auth kikapcsolva (belső hálózat)
+# max_body_size_mb = 10       # Max request body (default: 10 MB)
+# request_timeout_secs = 600  # Global safety-net timeout (default: 600s)
+# max_connections = 1024       # Max concurrent connections (default: 1024)
+
+# ============ BACKENDS ============
+
+[backends.ollama]
+type = "local"
+base_url = "http://172.19.144.1:11434"
+format = "openai"
+
+[backends.anthropic]
+type = "remote"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+format = "anthropic"
+
+# ============ MODELLEK ============
+
+[models.qwen3_5_4b]
+name = "qwen3.5:4b"
+backend = "ollama"
+estimated_vram_mb = 5700
+default_priority = "high"
+
+[models.qwen3_5_4b.extra_body]
+think = false
+
+[models.qwen3_5_9b]
+name = "qwen3.5:9b"
+backend = "ollama"
+estimated_vram_mb = 8300
+default_priority = "high"
+
+[models.qwen3_5_9b.extra_body]
+think = false
+
+[models.bge_m3_embed]
+name = "bge-m3"
+backend = "ollama"
+estimated_vram_mb = 1200
+default_priority = "medium"
+
+[models.claude_sonnet]
+name = "claude-sonnet-4-20250514"
+backend = "anthropic"
+
+[models.claude_haiku]
+name = "claude-haiku-4-5-20251001"
+backend = "anthropic"
+
+# ============ GPU / VRAM ============
+
+[gpu.slots.slot_0]
+total_vram_mb = 16311    # RTX 5060 Ti (16 GB)
+overhead_mb = 2000       # OS + driver + Ollama runtime
+
+# ============ ROUTING ============
+
+[routing]
+default_fallback = "deny"
+privacy_header = "X-Privacy"
+priority_header = "X-Priority"
+
+# ============ RATE LIMITS ============
+
+[rate_limits.claude_sonnet]
+requests_per_minute = 50
+
+[rate_limits.default]
+requests_per_minute = 60
