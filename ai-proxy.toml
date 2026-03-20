@@ -18,6 +18,7 @@ type = "remote"
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
 format = "anthropic"
+timeout_secs = 300
 
 # ============ MODELLEK ============
 
