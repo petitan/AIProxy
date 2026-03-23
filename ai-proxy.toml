@@ -46,6 +46,13 @@ backend = "ollama"
 estimated_vram_mb = 1200
 default_priority = "medium"
 
+[models.qwen3_5_cloud]
+name = "qwen3.5:cloud"
+backend = "ollama"
+
+[models.qwen3_5_cloud.extra_body]
+think = false
+
 [models.claude_sonnet]
 name = "claude-sonnet-4-20250514"
 backend = "anthropic"
