@@ -1,0 +1,51 @@
+name: Build and push image
+
+# Az AIProxy az Ollama-gépre megy később (NEM ezen a Portainer stacken).
+# master push  → tag :dev és :<sha>
+# deploy push  → tag :latest és :<sha>
+# Portainer-webhook hívás nincs — nincs Portainer-stack itt.
+on:
+  push:
+    branches: [master, deploy]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install docker-cli (node:20-bookworm image-ben nincs)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq docker.io
+          docker --version
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."192.168.2.210:3000"]
+              http = true
+              insecure = true
+
+      - uses: docker/login-action@v3
+        with:
+          registry: 192.168.2.210:3000
+          username: ${{ gitea.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - id: tag
+        run: |
+          if [ "${{ gitea.ref_name }}" = "deploy" ]; then
+            echo "moving=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "moving=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            192.168.2.210:3000/${{ gitea.repository }}:${{ steps.tag.outputs.moving }}
+            192.168.2.210:3000/${{ gitea.repository }}:${{ gitea.sha }}
