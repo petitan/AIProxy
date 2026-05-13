@@ -39,6 +39,7 @@ default_priority = "high"
 
 [models.qwen3_5_9b.extra_body]
 think = false
+num_ctx = 16384
 
 [models.bge_m3_embed]
 name = "bge-m3"

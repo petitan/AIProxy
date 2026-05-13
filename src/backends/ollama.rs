@@ -177,6 +177,7 @@ fn openai_to_native(body: Value, stream: bool) -> Value {
     let direct_opts = [
         "temperature", "top_p", "seed", "stop",
         "frequency_penalty", "presence_penalty",
+        "num_ctx",
     ];
     for key in &direct_opts {
         if let Some(val) = obj.and_then(|o| o.get(*key)) {
