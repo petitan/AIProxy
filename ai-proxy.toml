@@ -80,5 +80,10 @@ priority_header = "X-Priority"
 [rate_limits.claude_sonnet]
 requests_per_minute = 50
 
+[rate_limits.bge_m3_embed]
+# Local GPU bge-m3 — no API cost, only HW throughput limits.
+# Batch RAG-import requires bursts of many requests per second.
+requests_per_minute = 6000
+
 [rate_limits.default]
 requests_per_minute = 60
