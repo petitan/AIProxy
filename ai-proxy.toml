@@ -10,7 +10,7 @@ log_level = "info"
 
 [backends.ollama]
 type = "local"
-base_url = "http://172.19.144.1:11434"
+base_url = "http://192.168.6.3:11434"
 format = "openai"
 
 [backends.anthropic]
