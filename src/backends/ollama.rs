@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::config::BackendConfig;
 use crate::error::ProxyError;
@@ -162,7 +163,23 @@ fn openai_to_native(body: Value, stream: bool) -> Value {
 
     // Convert messages: OpenAI content arrays → Ollama native (string + images)
     if let Some(messages) = obj.and_then(|o| o.get("messages")).and_then(|v| v.as_array()) {
-        let native_messages: Vec<Value> = messages.iter().map(|msg| convert_message(msg)).collect();
+        // tool_call_id -> function name térkép (a tool-eredmény üzenetekhez kell,
+        // mert Ollama natív a `tool_name` mezőt várja, az OpenAI csak tool_call_id-t ad).
+        let mut tc_names: HashMap<String, String> = HashMap::new();
+        for msg in messages {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    if let (Some(id), Some(name)) = (
+                        tc.get("id").and_then(|v| v.as_str()),
+                        tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()),
+                    ) {
+                        tc_names.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+        let native_messages: Vec<Value> =
+            messages.iter().map(|msg| convert_message(msg, &tc_names)).collect();
         n.insert("messages".to_string(), json!(native_messages));
     }
 
@@ -475,8 +492,48 @@ fn native_stream_to_openai_sse(
 ///
 /// Ollama native expects:
 ///   {"role":"user", "content":"...", "images":["ABC"]}
-fn convert_message(msg: &Value) -> Value {
+fn convert_message(msg: &Value, tc_names: &HashMap<String, String>) -> Value {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
     let content = msg.get("content");
+
+    // Tool-eredmény üzenet: OpenAI {role:tool, tool_call_id, content}
+    //   -> Ollama natív {role:tool, content, tool_name}
+    if role == "tool" {
+        let text = content.and_then(|c| c.as_str()).unwrap_or("");
+        let mut m = json!({"role": "tool", "content": text});
+        if let Some(name) = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .and_then(|id| tc_names.get(id))
+        {
+            m["tool_name"] = json!(name);
+        }
+        return m;
+    }
+
+    // Assistant tool-hívásokkal: OpenAI tool_calls (arguments JSON-string)
+    //   -> Ollama natív tool_calls (arguments objektum, id/type nélkül)
+    if role == "assistant" {
+        if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            let native_tcs: Vec<Value> = tcs
+                .iter()
+                .map(|tc| {
+                    let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                    let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let args_obj = match func.get("arguments") {
+                        Some(Value::String(s)) => {
+                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
+                        }
+                        Some(v) => v.clone(),
+                        None => json!({}),
+                    };
+                    json!({"function": {"name": name, "arguments": args_obj}})
+                })
+                .collect();
+            let text = content.and_then(|c| c.as_str()).unwrap_or("");
+            return json!({"role": "assistant", "content": text, "tool_calls": native_tcs});
+        }
+    }
 
     // If content is a string (or missing), pass through as-is
     let content_array = match content.and_then(|c| c.as_array()) {
