@@ -166,6 +166,13 @@ fn openai_to_native(body: Value, stream: bool) -> Value {
         n.insert("messages".to_string(), json!(native_messages));
     }
 
+    // Tools forwardolása: az Ollama natív /api/chat ugyanabban az OpenAI-alakban
+    // fogadja a `tools` tömböt. Eddig hiányzott → a modell sosem kapta meg az
+    // eszközöket, ezért nem emittált tool_call-t.
+    if let Some(tools) = obj.and_then(|o| o.get("tools")) {
+        n.insert("tools".to_string(), tools.clone());
+    }
+
     // Build options from OpenAI params + any existing options object
     let mut options = obj
         .and_then(|o| o.get("options"))
@@ -206,18 +213,65 @@ fn openai_to_native(body: Value, stream: bool) -> Value {
 
 // ─── Response conversion: Ollama native → OpenAI (non-streaming) ──────────
 
+/// Ollama natív assistant-üzenet → OpenAI alak. Az Ollama tool_calls formátuma
+/// {"function":{"name","arguments":{obj}}} — az OpenAI {"id","type":"function",
+/// "function":{"name","arguments":"<json string>"}}-t vár. Visszaadja az átalakított
+/// üzenetet és hogy volt-e tool_call.
+fn convert_native_message_to_openai(message: &Value) -> (Value, bool) {
+    let mut out = message.clone();
+    let mut has_tc = false;
+    if let Some(tcs) = message.get("tool_calls").and_then(|v| v.as_array()) {
+        if !tcs.is_empty() {
+            has_tc = true;
+            let converted: Vec<Value> = tcs
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| {
+                    let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                    let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let args = func.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    let args_str = if let Some(s) = args.as_str() {
+                        s.to_string()
+                    } else {
+                        serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
+                    };
+                    json!({
+                        "id": format!("call_{}", i),
+                        "type": "function",
+                        "function": {"name": name, "arguments": args_str}
+                    })
+                })
+                .collect();
+            if let Some(o) = out.as_object_mut() {
+                o.insert("tool_calls".to_string(), json!(converted));
+                // OpenAI: ha csak tool_call van, a content legyen null.
+                let empty = o.get("content").and_then(|c| c.as_str()).map(|s| s.is_empty()).unwrap_or(true);
+                if empty {
+                    o.insert("content".to_string(), Value::Null);
+                }
+            }
+        }
+    }
+    (out, has_tc)
+}
+
 fn native_to_openai_response(native: &Value) -> Value {
     let model = native.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let message = native.get("message").cloned().unwrap_or(json!({"role": "assistant", "content": ""}));
+    let raw_message = native.get("message").cloned().unwrap_or(json!({"role": "assistant", "content": ""}));
+    let (message, has_tool_calls) = convert_native_message_to_openai(&raw_message);
     let done_reason = native.get("done_reason").and_then(|v| v.as_str()).unwrap_or("stop");
 
     let prompt_tokens = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
     let completion_tokens = native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
     let created = unix_timestamp();
 
-    let finish_reason = match done_reason {
-        "length" => "length",
-        _ => "stop",
+    let finish_reason = if has_tool_calls {
+        "tool_calls"
+    } else {
+        match done_reason {
+            "length" => "length",
+            _ => "stop",
+        }
     };
 
     json!({

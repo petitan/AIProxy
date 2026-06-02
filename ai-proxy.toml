@@ -1,5 +1,5 @@
 [proxy]
-listen = "127.0.0.1:8800"
+listen = "0.0.0.0:8800"
 log_level = "info"
 # api_key_env = "AI_PROXY_KEY"  # Auth kikapcsolva (belső hálózat)
 # max_body_size_mb = 10       # Max request body (default: 10 MB)
