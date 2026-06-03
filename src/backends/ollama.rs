@@ -225,8 +225,32 @@ fn openai_to_native(body: Value, stream: bool) -> Value {
         }
     }
 
-    // max_tokens → num_predict
-    if let Some(val) = obj.and_then(|o| o.get("max_tokens")) {
+    // Normalize `stop`: OpenAI allows a single string, but Ollama's `options.stop`
+    // expects an array of strings. A bare string would otherwise be silently ignored
+    // (the stop sequence lost). String → [string]; arrays are filtered to strings.
+    if let Some(stop) = options.get("stop").cloned() {
+        let normalized = match stop {
+            Value::String(s) => Some(json!([s])),
+            Value::Array(arr) => {
+                let strs: Vec<Value> =
+                    arr.into_iter().filter(|e| e.is_string()).collect();
+                if strs.is_empty() { None } else { Some(Value::Array(strs)) }
+            }
+            _ => None, // number/bool/object/null → drop (invalid for Ollama)
+        };
+        match normalized {
+            Some(v) => { options.insert("stop".to_string(), v); }
+            None => { options.remove("stop"); }
+        }
+    }
+
+    // max_tokens / max_completion_tokens → num_predict. Accept both names so the
+    // mapping stays consistent with the streaming TPM estimator (chat.rs), which also
+    // falls back to max_completion_tokens — otherwise the model could run with the
+    // default num_predict while the rate limiter budgets for the requested value.
+    if let Some(val) = obj
+        .and_then(|o| o.get("max_tokens").or_else(|| o.get("max_completion_tokens")))
+    {
         options.entry("num_predict".to_string()).or_insert_with(|| val.clone());
     }
 
@@ -272,8 +296,11 @@ fn native_tool_call_to_openai(tc: &Value, i: usize, include_index: bool) -> Valu
 
     let mut obj = serde_json::Map::new();
     if include_index {
-        let idx = func.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64);
-        obj.insert("index".to_string(), json!(idx));
+        // Use the positional index within the chunk, NOT the upstream `function.index`.
+        // Ollama emits all tool_calls complete in one chunk; if it sets `index:0` on each
+        // (or omits it), keying off `function.index` would collapse multiple tool_calls
+        // into one on the OpenAI client side. The chunk position is the reliable key.
+        obj.insert("index".to_string(), json!(i as u64));
     }
     obj.insert("id".to_string(), json!(id));
     obj.insert("type".to_string(), json!("function"));
@@ -603,6 +630,21 @@ fn native_stream_to_openai_sse(
 ///
 /// Ollama native expects:
 ///   {"role":"user", "content":"...", "images":["ABC"]}
+/// Extract plain text from an OpenAI `content` field, which may be a string or an
+/// array of content parts. Joins the `text` of all text parts. Image parts are ignored
+/// here — callers that need images handle the array form separately.
+fn content_to_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 fn convert_message(msg: &Value, tc_names: &HashMap<String, String>) -> Value {
     let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
     let content = msg.get("content");
@@ -610,14 +652,16 @@ fn convert_message(msg: &Value, tc_names: &HashMap<String, String>) -> Value {
     // Tool-eredmény üzenet: OpenAI {role:tool, tool_call_id, content}
     //   -> Ollama natív {role:tool, content, tool_name}
     if role == "tool" {
-        let text = content.and_then(|c| c.as_str()).unwrap_or("");
+        let text = content_to_text(content);
         let mut m = json!({"role": "tool", "content": text});
-        if let Some(name) = msg
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .and_then(|id| tc_names.get(id))
-        {
-            m["tool_name"] = json!(name);
+        if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+            match tc_names.get(id) {
+                Some(name) => m["tool_name"] = json!(name),
+                None => tracing::warn!(
+                    tool_call_id = %id,
+                    "tool message references unknown tool_call_id — tool_name omitted (multi-turn tool mapping may be incomplete)"
+                ),
+            }
         }
         return m;
     }
@@ -641,7 +685,7 @@ fn convert_message(msg: &Value, tc_names: &HashMap<String, String>) -> Value {
                     json!({"function": {"name": name, "arguments": args_obj}})
                 })
                 .collect();
-            let text = content.and_then(|c| c.as_str()).unwrap_or("");
+            let text = content_to_text(content);
             return json!({"role": "assistant", "content": text, "tool_calls": native_tcs});
         }
     }

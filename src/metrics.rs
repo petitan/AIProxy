@@ -36,6 +36,9 @@ impl ModelMetrics {
                 "min": latency.min_ms,
                 "max": latency.max_ms,
                 "p95_approx": latency.approx_p95(),
+                // p95 is computed over the recent ring buffer only, NOT all `count`
+                // requests — expose the sample size so it isn't misread as global.
+                "p95_sample_size": latency.p95_sample_size(),
             })
         } else {
             json!({
@@ -141,8 +144,16 @@ impl LatencyTracker {
         }
         let mut sorted = self.recent.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((sorted.len() as f64) * 0.95).ceil() as usize;
+        // Nearest-rank on a 0-based array: index = round((n-1) * 0.95). `ceil(n*0.95)`
+        // biased one position high (e.g. n=256 → 244 instead of ~243).
+        let idx = (((sorted.len() - 1) as f64) * 0.95).round() as usize;
         sorted[idx.min(sorted.len() - 1)]
+    }
+
+    /// Number of samples the p95 is computed over (the recent ring buffer size, capped
+    /// at RECENT_BUFFER_SIZE). Exposed so callers don't read p95 as covering all requests.
+    fn p95_sample_size(&self) -> usize {
+        self.recent.len()
     }
 }
 

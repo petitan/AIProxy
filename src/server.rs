@@ -153,6 +153,7 @@ pub fn build_router(config: ProxyConfig) -> Router {
     let circuit_breaker = CircuitBreaker::new(
         config.circuit_breaker.failure_threshold,
         config.circuit_breaker.recovery_timeout_secs,
+        config.backends.keys().map(|s| s.as_str()),
     );
 
     // Resolve API key from env var at startup (not per-request)

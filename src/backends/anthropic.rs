@@ -16,6 +16,24 @@ use super::DEFAULT_MAX_TOKENS;
 //  OpenAI → Anthropic REQUEST conversion
 // ═══════════════════════════════════════════════════════════════════
 
+/// Coerce a JSON value to `u64` for a required-integer field, or `BadRequest`.
+/// Accepts integers and whole non-negative floats (some clients send `100.0`);
+/// rejects strings, booleans, objects, negatives, fractional/out-of-range floats.
+fn coerce_u64_field(v: &Value, field: &str) -> Result<u64, ProxyError> {
+    if let Some(n) = v.as_u64() {
+        return Ok(n);
+    }
+    if let Some(f) = v.as_f64() {
+        if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64 {
+            return Ok(f as u64);
+        }
+    }
+    Err(ProxyError::BadRequest(format!(
+        "'{}' must be a non-negative integer, got: {}",
+        field, v
+    )))
+}
+
 fn convert_request(openai_body: &Value) -> Result<Value, ProxyError> {
     let model = openai_body
         .get("model")
@@ -56,11 +74,16 @@ fn convert_request(openai_body: &Value) -> Result<Value, ProxyError> {
     // need merging. Tool results (mapped to "user") may collide with the next user message.
     let anthropic_messages = merge_consecutive_roles(anthropic_messages);
 
-    let max_tokens = openai_body
+    // max_tokens: a missing field (or explicit null) → default; a PRESENT but wrong-typed
+    // value (string, bool, fractional/out-of-range) → 400 rather than a silent fallback to
+    // the default (which would change the client's intended limit and cost).
+    let max_tokens = match openai_body
         .get("max_tokens")
         .or_else(|| openai_body.get("max_completion_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+    {
+        None | Some(Value::Null) => DEFAULT_MAX_TOKENS,
+        Some(v) => coerce_u64_field(v, "max_tokens")?,
+    };
 
     let stream = openai_body
         .get("stream")
@@ -104,12 +127,36 @@ fn convert_request(openai_body: &Value) -> Result<Value, ProxyError> {
     if let Some(top_k) = openai_body.get("top_k") {
         request["top_k"] = top_k.clone();
     }
+    // stop → stop_sequences. Anthropic requires an array of strings. Explicit null = "no
+    // stop" (OpenAI idiom) → skip. A wrong-typed value (number/object) or a non-string
+    // array element → 400, instead of forwarding an invalid body that the backend would
+    // reject as a masked 502.
     if let Some(stop) = openai_body.get("stop") {
-        request["stop_sequences"] = match stop {
-            Value::String(s) => json!([s]),
-            Value::Array(_) => stop.clone(),
-            _ => stop.clone(),
-        };
+        if !stop.is_null() {
+            request["stop_sequences"] = match stop {
+                Value::String(s) => json!([s]),
+                Value::Array(arr) => {
+                    let seqs: Vec<Value> = arr
+                        .iter()
+                        .map(|e| {
+                            e.as_str()
+                                .map(|s| Value::String(s.to_string()))
+                                .ok_or_else(|| {
+                                    ProxyError::BadRequest(
+                                        "'stop' array elements must be strings".to_string(),
+                                    )
+                                })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Value::Array(seqs)
+                }
+                _ => {
+                    return Err(ProxyError::BadRequest(
+                        "'stop' must be a string or array of strings".to_string(),
+                    ))
+                }
+            };
+        }
     }
 
     // response_format → Anthropic system prompt instruction
@@ -220,10 +267,12 @@ fn convert_user_message(msg: &Value) -> Result<Value, ProxyError> {
     let anthropic_content = match &content {
         Value::String(_) => content.clone(),
         Value::Array(parts) => {
+            // Propagate conversion errors (e.g. malformed data URI) instead of silently
+            // dropping the bad part — otherwise a broken image would vanish from the request.
             let converted: Vec<Value> = parts
                 .iter()
-                .filter_map(|part| convert_content_part(part).ok())
-                .collect();
+                .map(convert_content_part)
+                .collect::<Result<_, _>>()?;
             Value::Array(converted)
         }
         Value::Null => Value::String(String::new()),
@@ -247,9 +296,7 @@ fn convert_assistant_message(msg: &Value) -> Result<Value, ProxyError> {
         }
     } else if let Some(parts) = msg.get("content").and_then(|v| v.as_array()) {
         for part in parts {
-            if let Ok(converted) = convert_content_part(part) {
-                content_blocks.push(converted);
-            }
+            content_blocks.push(convert_content_part(part)?);
         }
     }
 
@@ -294,10 +341,15 @@ fn convert_tool_call_to_tool_use(tc: &Value) -> Option<Value> {
 /// OpenAI: {"role":"tool","tool_call_id":"call_x","content":"result text"}
 /// Anthropic: {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_x","content":"result text"}]}
 fn convert_tool_result_message(msg: &Value) -> Result<Value, ProxyError> {
+    // tool_use_id must reference a prior tool_use block — an empty/missing one would make
+    // Anthropic reject the request (masked as a 502), so surface it as an explicit 400.
     let tool_use_id = msg
         .get("tool_call_id")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ProxyError::BadRequest("tool message missing required 'tool_call_id'".to_string())
+        })?;
 
     let content = msg.get("content").cloned().unwrap_or(Value::String(String::new()));
 
@@ -305,11 +357,10 @@ fn convert_tool_result_message(msg: &Value) -> Result<Value, ProxyError> {
     let tool_result_content = match &content {
         Value::String(_) => content.clone(),
         Value::Array(parts) => {
-            // Convert content parts
             let converted: Vec<Value> = parts
                 .iter()
-                .filter_map(|p| convert_content_part(p).ok())
-                .collect();
+                .map(convert_content_part)
+                .collect::<Result<_, _>>()?;
             Value::Array(converted)
         }
         _ => content.clone(),
@@ -348,17 +399,23 @@ fn convert_content_part(part: &Value) -> Result<Value, ProxyError> {
                     .unwrap_or("");
 
                 if let Some(base64_data) = url.strip_prefix("data:") {
-                    if let Some((media_info, data)) = base64_data.split_once(',') {
-                        let media_type = media_info.trim_end_matches(";base64");
-                        return Ok(json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data,
-                            }
-                        }));
-                    }
+                    // A data URI must contain a comma separating the media-type from the
+                    // payload. A malformed one (no comma) would otherwise be forwarded
+                    // whole as a `url` source — surface it as a 400 instead.
+                    let (media_info, data) = base64_data.split_once(',').ok_or_else(|| {
+                        ProxyError::BadRequest(
+                            "Malformed data URI in image_url (missing ',')".to_string(),
+                        )
+                    })?;
+                    let media_type = media_info.trim_end_matches(";base64");
+                    return Ok(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data,
+                        }
+                    }));
                 }
                 Ok(json!({
                     "type": "image",
@@ -480,9 +537,21 @@ fn convert_response(anthropic_resp: &Value, model: &str) -> Value {
     let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
     let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
+    // content: text if present; null only when there ARE tool_calls (OpenAI allows a
+    // tool-only assistant message with content:null). With neither text nor tool_calls
+    // (e.g. a thinking-only or truncated response) emit "" rather than null — some OpenAI
+    // clients treat content:null without tool_calls as invalid.
+    let content_value = if !text.is_empty() {
+        Value::String(text)
+    } else if !tool_calls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(String::new())
+    };
+
     let mut message = json!({
         "role": "assistant",
-        "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+        "content": content_value,
     });
 
     if !tool_calls.is_empty() {
@@ -781,6 +850,9 @@ fn build_json_response(status: StatusCode, body: &Value) -> Response {
         .expect("valid JSON response builder")
 }
 
+// `current_event_type` is set by the shared `process_line!` macro; in the end-of-stream
+// flush expansion a trailing `event:` line's assignment is never read (benign dead store).
+#[allow(unused_assignments)]
 async fn stream_anthropic_response(
     resp: reqwest::Response,
     model: &str,
@@ -801,10 +873,81 @@ async fn stream_anthropic_response(
         let mut byte_stream = Box::pin(byte_stream);
         let mut got_done = false;
 
-        loop {
+        // Process one SSE line (event:/data:). Sets `got_done` and yields the terminal
+        // chunks on message_stop / error. A macro (not an async fn) so the SAME logic runs
+        // both in the read loop and in the end-of-stream flush — `yield` can't cross a
+        // function boundary inside `async_stream::stream!`.
+        macro_rules! process_line {
+            ($line:expr) => {{
+                let line: &str = $line;
+                if let Some(event) = line.strip_prefix("event: ") {
+                    current_event_type = event.trim().to_string();
+                } else if let Some(data_str) = line.strip_prefix("data: ") {
+                    if let Ok(data) = serde_json::from_str::<Value>(data_str) {
+                        if current_event_type == "message_start" {
+                            if let Some(usage) = data.pointer("/message/usage") {
+                                state.input_tokens = usage.get("input_tokens")
+                                    .and_then(|v| v.as_u64()).unwrap_or(0);
+                            }
+                        }
+                        if current_event_type == "message_delta" {
+                            if let Some(usage) = data.get("usage") {
+                                state.output_tokens = usage.get("output_tokens")
+                                    .and_then(|v| v.as_u64()).unwrap_or(0);
+                            }
+                        }
+                        if current_event_type == "message_stop" {
+                            if include_usage {
+                                let usage_json = json!({
+                                    "id": &state.stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": chrono::Utc::now().timestamp(),
+                                    "model": &state.model,
+                                    "choices": [],
+                                    "usage": {
+                                        "prompt_tokens": state.input_tokens,
+                                        "completion_tokens": state.output_tokens,
+                                        "total_tokens": state.input_tokens + state.output_tokens,
+                                    }
+                                });
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("data: {}\n\n", usage_json)));
+                            }
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
+                            got_done = true;
+                            circuit_breaker.record_success(&backend_name);
+                        } else if current_event_type == "error" {
+                            // Mid-stream Anthropic error (e.g. overloaded_error) — surface it
+                            // explicitly instead of swallowing it into a silent fallback.
+                            let err = data.get("error");
+                            let emsg = err.and_then(|e| e.get("message")).and_then(|v| v.as_str())
+                                .unwrap_or("upstream stream error");
+                            let etype = err.and_then(|e| e.get("type")).and_then(|v| v.as_str())
+                                .unwrap_or("api_error");
+                            tracing::warn!(error_type = %etype, message = %emsg, "Anthropic stream error event");
+                            let err_chunk = json!({
+                                "id": &state.stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": &state.model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                "error": {"message": emsg, "type": etype},
+                            });
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("data: {}\n\n", err_chunk)));
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
+                            got_done = true;
+                            circuit_breaker.record_failure(&backend_name);
+                        } else if let Some(converted) = convert_sse_event(&mut state, &current_event_type, &data) {
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(converted));
+                        }
+                    }
+                }
+            }};
+        }
+
+        'outer: loop {
             let chunk_result = match tokio::time::timeout(chunk_timeout, byte_stream.next()).await {
                 Ok(Some(result)) => result,
-                Ok(None) => break, // Stream ended normally
+                Ok(None) => break 'outer, // Stream ended normally
                 Err(_elapsed) => {
                     tracing::error!(
                         timeout_secs = chunk_timeout.as_secs(),
@@ -821,7 +964,7 @@ async fn stream_anthropic_response(
                     got_done = true;
                     // Chunk timeout is a backend health signal — count it as a failure.
                     circuit_breaker.record_failure(&backend_name);
-                    break;
+                    break 'outer;
                 }
             };
 
@@ -834,57 +977,14 @@ async fn stream_anthropic_response(
                         if line_end > 0 && raw_buf[line_end - 1] == b'\r' {
                             line_end -= 1;
                         }
-                        let line_bytes = &raw_buf[..line_end];
-
-                        if let Ok(line) = std::str::from_utf8(line_bytes) {
-                            if let Some(event) = line.strip_prefix("event: ") {
-                                current_event_type = event.trim().to_string();
-                            } else if let Some(data_str) = line.strip_prefix("data: ") {
-                                if let Ok(data) = serde_json::from_str::<Value>(data_str) {
-                                    // Track usage from message_start and message_delta
-                                    if current_event_type == "message_start" {
-                                        if let Some(usage) = data.pointer("/message/usage") {
-                                            state.input_tokens = usage.get("input_tokens")
-                                                .and_then(|v| v.as_u64()).unwrap_or(0);
-                                        }
-                                    }
-                                    if current_event_type == "message_delta" {
-                                        if let Some(usage) = data.get("usage") {
-                                            state.output_tokens = usage.get("output_tokens")
-                                                .and_then(|v| v.as_u64()).unwrap_or(0);
-                                        }
-                                    }
-
-                                    if current_event_type == "message_stop" {
-                                        // Emit usage chunk BEFORE [DONE] (OpenAI spec)
-                                        if include_usage {
-                                            let usage_json = json!({
-                                                "id": &state.stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": chrono::Utc::now().timestamp(),
-                                                "model": &state.model,
-                                                "choices": [],
-                                                "usage": {
-                                                    "prompt_tokens": state.input_tokens,
-                                                    "completion_tokens": state.output_tokens,
-                                                    "total_tokens": state.input_tokens + state.output_tokens,
-                                                }
-                                            });
-                                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("data: {}\n\n", usage_json)));
-                                        }
-                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
-                                        got_done = true;
-                                        // Clean completion (message_stop) — backend is healthy.
-                                        circuit_breaker.record_success(&backend_name);
-                                    } else if let Some(converted) = convert_sse_event(&mut state, &current_event_type, &data) {
-                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(converted));
-                                    }
-                                }
-                            }
-                        }
-
-                        // O(1) split instead of O(n) copy
+                        // Copy the line out (owned) BEFORE draining, so processing can yield
+                        // without holding a borrow of raw_buf.
+                        let line = std::str::from_utf8(&raw_buf[..line_end]).map(|s| s.to_string());
                         let _ = raw_buf.drain(..newline_pos + 1);
+                        if let Ok(line) = line {
+                            process_line!(&line);
+                        }
+                        if got_done { break 'outer; }
                     }
                 }
                 Err(e) => {
@@ -899,9 +999,21 @@ async fn stream_anthropic_response(
                     got_done = true;
                     // Stream read error — count it against the backend.
                     circuit_breaker.record_failure(&backend_name);
-                    break;
+                    break 'outer;
                 }
             }
+        }
+
+        // C1: flush a trailing line that wasn't newline-terminated (some upstreams don't
+        // terminate the final event before closing). Without this the last token or the
+        // real finish_reason (length/tool_calls) would be lost and replaced by a generic
+        // "stop" in the premature-end fallback below.
+        if !got_done && !raw_buf.is_empty() {
+            if let Ok(line) = std::str::from_utf8(&raw_buf) {
+                let line = line.strip_suffix('\r').unwrap_or(line).to_string();
+                process_line!(&line);
+            }
+            raw_buf.clear();
         }
 
         // Premature stream end — no message_stop received
@@ -990,6 +1102,70 @@ mod tests {
         // max_completion_tokens (OpenAI alias)
         let openai = json!({"model": "test", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 200});
         assert_eq!(convert_request(&openai).unwrap()["max_tokens"], 200);
+    }
+
+    fn base_req(extra: Value) -> Value {
+        let mut v = json!({"model": "test", "messages": [{"role": "user", "content": "hi"}]});
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn test_max_tokens_strict() {
+        // missing → default
+        assert_eq!(convert_request(&base_req(json!({}))).unwrap()["max_tokens"], DEFAULT_MAX_TOKENS);
+        // explicit null → default (OpenAI idiom)
+        assert_eq!(convert_request(&base_req(json!({"max_tokens": null}))).unwrap()["max_tokens"], DEFAULT_MAX_TOKENS);
+        // whole float → accepted
+        assert_eq!(convert_request(&base_req(json!({"max_tokens": 100.0}))).unwrap()["max_tokens"], 100);
+        // string → 400
+        assert!(matches!(convert_request(&base_req(json!({"max_tokens": "100"}))), Err(ProxyError::BadRequest(_))));
+        // fractional float → 400
+        assert!(matches!(convert_request(&base_req(json!({"max_tokens": 1.5}))), Err(ProxyError::BadRequest(_))));
+    }
+
+    #[test]
+    fn test_stop_strict() {
+        // string → array
+        assert_eq!(convert_request(&base_req(json!({"stop": "\n"}))).unwrap()["stop_sequences"], json!(["\n"]));
+        // array of strings → kept
+        assert_eq!(convert_request(&base_req(json!({"stop": ["a", "b"]}))).unwrap()["stop_sequences"], json!(["a", "b"]));
+        // null → skipped (no stop_sequences)
+        assert!(convert_request(&base_req(json!({"stop": null}))).unwrap().get("stop_sequences").is_none());
+        // number → 400
+        assert!(matches!(convert_request(&base_req(json!({"stop": 5}))), Err(ProxyError::BadRequest(_))));
+        // array with non-string element → 400
+        assert!(matches!(convert_request(&base_req(json!({"stop": ["a", 5]}))), Err(ProxyError::BadRequest(_))));
+    }
+
+    #[test]
+    fn test_malformed_data_uri_rejected() {
+        // data: prefix without a comma → 400
+        let part = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64"}});
+        assert!(matches!(convert_content_part(&part), Err(ProxyError::BadRequest(_))));
+        // valid data URI still works
+        let part = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,ABC"}});
+        assert_eq!(convert_content_part(&part).unwrap()["source"]["data"], "ABC");
+    }
+
+    #[test]
+    fn test_missing_tool_call_id_rejected() {
+        let msg = json!({"role": "tool", "content": "result"});
+        assert!(matches!(convert_tool_result_message(&msg), Err(ProxyError::BadRequest(_))));
+        let msg = json!({"role": "tool", "tool_call_id": "", "content": "result"});
+        assert!(matches!(convert_tool_result_message(&msg), Err(ProxyError::BadRequest(_))));
+    }
+
+    #[test]
+    fn test_empty_response_content_not_null() {
+        // no text, no tool_calls → content "" (not null)
+        let resp = json!({"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 0}});
+        let out = convert_response(&resp, "test");
+        assert_eq!(out["choices"][0]["message"]["content"], "");
     }
 
     #[test]

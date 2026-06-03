@@ -31,12 +31,11 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Load config early so we can use log_level for the subscriber.
-    // Config validation runs later in ProxyConfig::load(), but we need the log_level now.
-    let config_preview: toml::Value = {
-        let content = std::fs::read_to_string(&cli.config)?;
-        content.parse()?
-    };
+    // Read the config file ONCE. We need log_level before initializing tracing, then the
+    // fully-validated config afterwards — both come from this single read (no second read,
+    // no TOCTOU window where the file could change between the two).
+    let config_content = std::fs::read_to_string(&cli.config)?;
+    let config_preview: toml::Value = config_content.parse()?;
     let config_log_level = config_preview
         .get("proxy")
         .and_then(|p| p.get("log_level"))
@@ -66,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("AI Proxy v{}", env!("CARGO_PKG_VERSION"));
 
-    let config = ProxyConfig::load(&cli.config)?;
+    let config = ProxyConfig::from_toml_str(&config_content)?;
 
     tracing::info!(
         listen = %config.proxy.listen,

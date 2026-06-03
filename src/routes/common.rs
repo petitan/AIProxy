@@ -10,24 +10,26 @@ use crate::rate_limiter::CircuitBreaker;
 
 /// Record circuit-breaker feedback for a completed request.
 ///
-/// Each failed retry attempt counts as a separate failure, then the final result is
-/// recorded: success on 2xx, failure on 5xx or connection error. **4xx is neutral** —
-/// it does not reset `consecutive_failures`, preventing CB bypass via crafted 400s.
+/// The outcome is counted **per request**, not per retry attempt: one failing request
+/// records exactly one failure, regardless of how many internal retries it took. Counting
+/// each retry attempt separately made `failure_threshold` misleading — a single failing
+/// remote request (2 retries) recorded 3 failures, so a threshold of 5 tripped after ~2
+/// requests. `_failed_attempts` is kept only for potential future logging.
+///
+/// Recording: success on non-streaming 2xx, failure on 5xx or connection error, 4xx is
+/// neutral (does not reset `consecutive_failures`, preventing CB bypass via crafted 400s).
 ///
 /// For **streaming** requests a 2xx here only means the upstream returned headers — the
 /// body may still fail mid-stream (read error, chunk timeout, empty completion). So the
 /// final success/failure is NOT recorded here for a streaming 2xx; the stream generator
-/// records it at stream end instead. Retry failures and non-2xx are still recorded here.
+/// records it at stream end instead.
 pub fn record_cb_outcome(
     cb: &CircuitBreaker,
     backend_name: &str,
-    failed_attempts: u32,
+    _failed_attempts: u32,
     result: &Result<Response, ProxyError>,
     stream: bool,
 ) {
-    for _ in 0..failed_attempts {
-        cb.record_failure(backend_name);
-    }
     match result {
         // Non-streaming 2xx: success now. Streaming 2xx is intentionally NOT matched here —
         // it falls through to the neutral arm, and the stream generator records the outcome

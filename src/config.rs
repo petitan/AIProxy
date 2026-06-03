@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::error::ProxyError;
 
@@ -230,10 +229,10 @@ impl ModelConfig {
 }
 
 impl ProxyConfig {
-    pub fn load(path: &Path) -> Result<Self, ProxyError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ProxyError::Config(format!("Failed to read config {}: {}", path.display(), e)))?;
-        let config: ProxyConfig = toml::from_str(&content)
+    /// Parse + validate config from already-read TOML content. The caller reads the file
+    /// once (avoiding a second read + TOCTOU window between the log-level preview and load).
+    pub fn from_toml_str(content: &str) -> Result<Self, ProxyError> {
+        let config: ProxyConfig = toml::from_str(content)
             .map_err(|e| ProxyError::Config(format!("Failed to parse config: {}", e)))?;
         config.validate()?;
         Ok(config)

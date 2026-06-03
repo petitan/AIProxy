@@ -61,11 +61,16 @@ impl TokenBucket {
     }
 
     /// Consume tokens without checking (post-request deduction).
-    /// Can go negative — subsequent requests will be denied until refilled.
+    /// `amount` may be negative (refund of an over-reservation).
     /// Returns the remaining token count after consumption.
+    ///
+    /// Clamped to `[-capacity, capacity]`: the lower bound caps the worst-case
+    /// lockout after a bogus large token report at ~60s of refill (instead of
+    /// hours); the upper bound prevents a refund from pushing the bucket above
+    /// its capacity.
     fn consume(&mut self, amount: f64) -> f64 {
         self.refill();
-        self.tokens -= amount;
+        self.tokens = (self.tokens - amount).clamp(-self.capacity, self.capacity);
         self.tokens
     }
 
@@ -297,35 +302,55 @@ impl BackendCircuit {
     }
 }
 
-/// Thread-safe circuit breaker for all backends
+/// Thread-safe circuit breaker for all backends. Circuits are pre-populated per
+/// configured backend at construction; the per-backend threshold/timeout live in each
+/// `BackendCircuit`, so this struct holds no global copies.
 pub struct CircuitBreaker {
     circuits: Mutex<HashMap<String, BackendCircuit>>,
-    failure_threshold: u32,
-    recovery_timeout_secs: u64,
 }
 
 impl CircuitBreaker {
-    pub fn new(failure_threshold: u32, recovery_timeout_secs: u64) -> Self {
+    /// Create a circuit breaker, pre-populating one circuit per known backend name.
+    /// Pre-population (rather than lazily inserting on first use) bounds the `circuits`
+    /// map to the configured backends — a stray/unknown backend name can no longer grow
+    /// it without bound.
+    pub fn new<'a>(
+        failure_threshold: u32,
+        recovery_timeout_secs: u64,
+        backend_names: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let circuits: HashMap<String, BackendCircuit> = backend_names
+            .map(|name| {
+                (
+                    name.to_string(),
+                    BackendCircuit::new(failure_threshold, recovery_timeout_secs),
+                )
+            })
+            .collect();
         tracing::info!(
             failure_threshold = failure_threshold,
             recovery_timeout_secs = recovery_timeout_secs,
+            backends = circuits.len(),
             "Circuit breaker initialized"
         );
         Self {
-            circuits: Mutex::new(HashMap::new()),
-            failure_threshold,
-            recovery_timeout_secs,
+            circuits: Mutex::new(circuits),
         }
     }
 
     /// Check if a request to this backend should be allowed.
-    /// Returns true if allowed, false if circuit is open.
+    /// Returns true if allowed, false if circuit is open. An unknown backend name
+    /// (not pre-populated from config) is allowed fail-safe and logged — it must not
+    /// silently create a new circuit (that's what let the map grow unbounded).
     pub fn allow_request(&self, backend_name: &str) -> bool {
         let mut circuits = self.circuits.lock();
-        let circuit = circuits
-            .entry(backend_name.to_string())
-            .or_insert_with(|| BackendCircuit::new(self.failure_threshold, self.recovery_timeout_secs));
-        circuit.allow_request()
+        match circuits.get_mut(backend_name) {
+            Some(circuit) => circuit.allow_request(),
+            None => {
+                tracing::warn!(backend = %backend_name, "Circuit breaker: unknown backend — allowing (fail-safe)");
+                true
+            }
+        }
     }
 
     /// Record a successful response for a backend
@@ -339,10 +364,12 @@ impl CircuitBreaker {
     /// Record a failure for a backend
     pub fn record_failure(&self, backend_name: &str) {
         let mut circuits = self.circuits.lock();
-        let circuit = circuits
-            .entry(backend_name.to_string())
-            .or_insert_with(|| BackendCircuit::new(self.failure_threshold, self.recovery_timeout_secs));
-        circuit.record_failure();
+        match circuits.get_mut(backend_name) {
+            Some(circuit) => circuit.record_failure(),
+            None => {
+                tracing::warn!(backend = %backend_name, "Circuit breaker: failure for unknown backend — ignored");
+            }
+        }
     }
 
     /// Get current state of a backend's circuit (for /status endpoint)
@@ -571,6 +598,18 @@ mod tests {
     }
 
     #[test]
+    fn test_consume_clamps_to_capacity_bounds() {
+        let mut b = TokenBucket::new(1000);
+        // A bogus huge report must not drive the bucket arbitrarily negative — it's
+        // clamped at -capacity so recovery takes at most ~60s, not hours.
+        b.consume(1_000_000.0);
+        assert_eq!(b.tokens, -1000.0);
+        // A refund (negative amount) is clamped to +capacity, not above.
+        b.consume(-1_000_000.0);
+        assert_eq!(b.tokens, 1000.0);
+    }
+
+    #[test]
     fn test_tpm_default_fallback() {
         let mut limits = HashMap::new();
         limits.insert(
@@ -637,14 +676,14 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_closed_by_default() {
-        let cb = CircuitBreaker::new(3, 30);
+        let cb = CircuitBreaker::new(3, 30, ["backend1"].into_iter());
         assert!(cb.allow_request("backend1"));
         assert_eq!(cb.state("backend1"), "closed");
     }
 
     #[test]
     fn test_circuit_breaker_opens_after_threshold() {
-        let cb = CircuitBreaker::new(3, 30);
+        let cb = CircuitBreaker::new(3, 30, ["backend1"].into_iter());
 
         cb.record_failure("backend1");
         assert!(cb.allow_request("backend1")); // 1 failure, still closed
@@ -658,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_success_resets() {
-        let cb = CircuitBreaker::new(3, 30);
+        let cb = CircuitBreaker::new(3, 30, ["backend1"].into_iter());
 
         cb.record_failure("backend1");
         cb.record_failure("backend1");
@@ -675,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_half_open_recovery() {
-        let cb = CircuitBreaker::new(2, 0); // 0 second recovery for testing
+        let cb = CircuitBreaker::new(2, 0, ["b1"].into_iter()); // 0 second recovery for testing
 
         cb.record_failure("b1");
         cb.record_failure("b1");
@@ -696,7 +735,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_half_open_failure() {
-        let cb = CircuitBreaker::new(2, 0);
+        let cb = CircuitBreaker::new(2, 0, ["b1"].into_iter());
 
         cb.record_failure("b1");
         cb.record_failure("b1");
@@ -709,7 +748,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_independent_backends() {
-        let cb = CircuitBreaker::new(2, 30);
+        let cb = CircuitBreaker::new(2, 30, ["backend_a", "backend_b"].into_iter());
 
         cb.record_failure("backend_a");
         cb.record_failure("backend_a");
