@@ -88,8 +88,7 @@ pub async fn chat_completions(
                 "Ollama response has no token usage (eval_count) — TPM accounting may undercount"
             );
         }
-        let prompt_tokens = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let completion_tokens = native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let (prompt_tokens, completion_tokens) = ollama_usage(&native);
 
         let openai_resp = native_to_openai_response(&native);
         let out = serde_json::to_vec(&openai_resp).unwrap_or_else(|_| b"{}".to_vec());
@@ -330,14 +329,23 @@ fn convert_native_message_to_openai(message: &Value) -> (Value, bool) {
     (out, has_tc)
 }
 
+/// Extract `(prompt_tokens, completion_tokens)` from an Ollama native response or final
+/// `done` chunk. Missing counts default to 0 (a known undercount, warned about at the
+/// non-streaming call site). Single source of truth for the streaming and non-streaming
+/// token accounting so the two can't drift.
+fn ollama_usage(native: &Value) -> (u64, u64) {
+    let prompt = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let completion = native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    (prompt, completion)
+}
+
 fn native_to_openai_response(native: &Value) -> Value {
     let model = native.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
     let raw_message = native.get("message").cloned().unwrap_or(json!({"role": "assistant", "content": ""}));
     let (message, has_tool_calls) = convert_native_message_to_openai(&raw_message);
     let done_reason = native.get("done_reason").and_then(|v| v.as_str()).unwrap_or("stop");
 
-    let prompt_tokens = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let completion_tokens = native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let (prompt_tokens, completion_tokens) = ollama_usage(native);
     let created = unix_timestamp();
 
     let finish_reason = if has_tool_calls {
@@ -462,14 +470,12 @@ fn native_stream_to_openai_sse(
                                 bytes::Bytes::from(format!("data: {}\n\n", chunk))
                             );
                             yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
-                            // Stream completed cleanly — the backend is healthy. Record the
-                            // outcome and reconcile the TPM reservation to the real usage.
+                            // Stream completed cleanly — the backend is healthy. Record the CB
+                            // outcome and publish the real usage; the body Drop guard reconciles
+                            // the TPM reservation (so it settles even on abort/disconnect).
                             ctx.circuit_breaker.record_success(&ctx.backend_name, ctx.probe);
-                            let actual = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0)
-                                + native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                            if actual > 0 {
-                                ctx.rate_limiter.reconcile_tokens(&ctx.model_key, ctx.reserved_tokens, actual);
-                            }
+                            let (p, c) = ollama_usage(&native);
+                            ctx.actual_tokens.store(p + c, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
 
@@ -575,8 +581,8 @@ fn native_stream_to_openai_sse(
                                 yield Ok::<_, std::io::Error>(
                                     bytes::Bytes::from(format!("data: {}\n\n", chunk))
                                 );
-                                final_usage = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0)
-                                    + native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let (p, c) = ollama_usage(&native);
+                                final_usage = p + c;
                                 emitted_finish = true;
                             }
                         }
@@ -595,9 +601,7 @@ fn native_stream_to_openai_sse(
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
                     if emitted_finish {
                         ctx.circuit_breaker.record_success(&ctx.backend_name, ctx.probe);
-                        if final_usage > 0 {
-                            ctx.rate_limiter.reconcile_tokens(&ctx.model_key, ctx.reserved_tokens, final_usage);
-                        }
+                        ctx.actual_tokens.store(final_usage, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                     }

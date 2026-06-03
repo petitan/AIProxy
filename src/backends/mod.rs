@@ -1,30 +1,45 @@
 pub mod anthropic;
 pub mod ollama;
 
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::config::{ApiFormat, BackendConfig};
 use crate::error::ProxyError;
-use crate::rate_limiter::{CircuitBreaker, RateLimiter};
+use crate::rate_limiter::CircuitBreaker;
+
+/// Default `max_tokens` when a request omits it — see DEFAULT_MAX_TOKENS below.
+///
+/// Resolve the effective `max_tokens` estimate from an OpenAI request body: `max_tokens`,
+/// then `max_completion_tokens`, else the default. Shared so the TPM-reservation estimate
+/// (routes) and the backend conversions agree on one value.
+pub fn resolve_max_tokens(body: &Value) -> u64 {
+    body.get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
 
 /// Context threaded into a streaming response so the generator can record the request's
 /// outcome at stream end — which is AFTER the handler has returned. Carries the circuit
-/// breaker (+ half-open probe token) for CB feedback and the rate limiter (+ model key and
-/// pre-reserved token estimate) for TPM reconciliation against the real usage.
+/// breaker (+ half-open probe token) for CB feedback, and an `actual_tokens` cell the
+/// generator writes the real usage into; the streaming response body's Drop guard
+/// (routes::chat) reads it to reconcile the TPM reservation — so the reservation is settled
+/// even if the stream fails or the client disconnects (the generator is dropped mid-flight).
 #[derive(Clone)]
 pub struct StreamCtx {
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub backend_name: String,
     pub probe: Option<u64>,
-    pub rate_limiter: Arc<RateLimiter>,
-    pub model_key: String,
-    pub reserved_tokens: u64,
+    /// Real token usage observed by the generator at clean completion (0 if the stream
+    /// failed or was aborted before producing usage). Shared with the body Drop guard.
+    pub actual_tokens: Arc<AtomicU64>,
 }
 
 /// Default `max_tokens` when a request omits it — shared across backends and the

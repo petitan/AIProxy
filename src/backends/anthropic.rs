@@ -909,13 +909,11 @@ async fn stream_anthropic_response(
                             }
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
                             got_done = true;
-                            // Clean completion: record success + reconcile the TPM reservation
-                            // to the real usage tracked from message_start/message_delta.
+                            // Clean completion: record CB success + publish the real usage
+                            // (from message_start/message_delta); the body Drop guard reconciles
+                            // the TPM reservation, so it settles even on abort/disconnect.
                             ctx.circuit_breaker.record_success(&ctx.backend_name, ctx.probe);
-                            let actual = state.input_tokens + state.output_tokens;
-                            if actual > 0 {
-                                ctx.rate_limiter.reconcile_tokens(&ctx.model_key, ctx.reserved_tokens, actual);
-                            }
+                            ctx.actual_tokens.store(state.input_tokens + state.output_tokens, std::sync::atomic::Ordering::Relaxed);
                         } else if current_event_type == "error" {
                             // Mid-stream Anthropic error (e.g. overloaded_error) — surface it
                             // explicitly instead of swallowing it into a silent fallback.

@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -13,10 +14,10 @@ use serde_json::Value;
 
 use super::common;
 use crate::backends;
-use crate::backends::{TokenUsage, DEFAULT_MAX_TOKENS};
+use crate::backends::TokenUsage;
 use crate::config::{BackendConfig, BackendType, ModelConfig};
 use crate::error::ProxyError;
-use crate::rate_limiter::RateLimitResult;
+use crate::rate_limiter::{RateLimitResult, RateLimiter};
 use crate::server::AppState;
 use crate::vram::coordinator::{AcquireResult, Priority, VramCoordinator};
 
@@ -254,11 +255,7 @@ pub async fn chat_completions(
     }
 
     // ── Estimate tokens for the TPM pre-reservation (max_tokens, or a default) ──
-    let request_max_tokens = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+    let request_max_tokens = backends::resolve_max_tokens(&body);
 
     // ── Rate limit check (after CB + VRAM; pre-reserves the estimate so concurrent
     //    requests can't burst past the TPM budget — reconciled to real usage below) ──
@@ -283,13 +280,14 @@ pub async fn chat_completions(
     }
 
     // ── Forward to backend ──
+    // Shared cell the stream generator writes the real usage into; the response body's
+    // Drop guard reads it to reconcile the TPM reservation (so it settles even on abort).
+    let actual_tokens = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stream_ctx = backends::StreamCtx {
         circuit_breaker: state.circuit_breaker.clone(),
         backend_name: active.backend_name.clone(),
         probe: active_probe,
-        rate_limiter: state.rate_limiter.clone(),
-        model_key: active.model_key.clone(),
-        reserved_tokens: request_max_tokens,
+        actual_tokens: actual_tokens.clone(),
     };
     let retry_result =
         backends::dispatch_chat(&state.client, &active.backend_config, body, stream, &stream_ctx)
@@ -347,46 +345,61 @@ pub async fn chat_completions(
         stream,
     );
 
-    // ── Demote to idle after completion (local backends only) ──
-    if active.is_local && active.estimated_vram > 0 {
-        if stream {
-            match result {
-                Ok(response) => {
-                    // Streaming OK: wrap the response body so demote happens when the stream ends (Drop)
-                    let (parts, body) = response.into_parts();
-                    let wrapped = DemoteOnDropBody::new(body, state.vram.clone(), active.model_name.clone());
-                    let response = Response::from_parts(parts, Body::new(wrapped));
-
-                    tracing::info!(
-                        model = %active.model_name,
-                        original_model = %model_name,
-                        backend = %active.backend_name,
-                        stream = true,
-                        status = response.status().as_u16(),
-                        latency_ms = latency_ms,
-                        "Chat completion streaming started"
-                    );
-
-                    return Ok(response);
-                }
-                Err(e) => {
-                    // Streaming Err: demote immediately since DemoteOnDropBody won't be created
-                    state.vram.demote_to_idle(&active.model_name);
-                    tracing::warn!(
-                        model = %active.model_name,
-                        original_model = %model_name,
-                        backend = %active.backend_name,
-                        stream = true,
-                        latency_ms = latency_ms,
-                        error = %e,
-                        "Chat completion failed (streaming)"
-                    );
-                    return Err(e);
-                }
+    // ── Streaming 2xx: wrap the body in a guard that, on stream end OR client disconnect
+    //    (Drop), reconciles the TPM reservation to the real usage the generator published
+    //    and demotes VRAM (local). This settles the reservation even if the stream is
+    //    aborted mid-flight (the generator dropped without reconciling). All backends are
+    //    wrapped — remote streams reserve TPM too. ──
+    if stream {
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let (parts, body) = resp.into_parts();
+                let vram = (active.is_local && active.estimated_vram > 0)
+                    .then(|| (state.vram.clone(), active.model_name.clone()));
+                let wrapped = StreamEndGuard::new(
+                    body,
+                    state.rate_limiter.clone(),
+                    active.model_key.clone(),
+                    request_max_tokens,
+                    actual_tokens.clone(),
+                    vram,
+                );
+                tracing::info!(
+                    model = %active.model_name,
+                    backend = %active.backend_name,
+                    stream = true,
+                    status = parts.status.as_u16(),
+                    latency_ms = latency_ms,
+                    "Chat completion streaming started"
+                );
+                return Ok(Response::from_parts(parts, Body::new(wrapped)));
             }
-        } else {
-            state.vram.demote_to_idle(&active.model_name);
+            other => {
+                // Streaming error / non-2xx: no stream body to guard. TPM already refunded
+                // above; demote VRAM now (local).
+                if active.is_local && active.estimated_vram > 0 {
+                    state.vram.demote_to_idle(&active.model_name);
+                }
+                match &other {
+                    Ok(resp) => tracing::info!(
+                        model = %active.model_name, backend = %active.backend_name,
+                        stream = true, status = resp.status().as_u16(), latency_ms = latency_ms,
+                        "Chat completion completed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        model = %active.model_name, backend = %active.backend_name,
+                        stream = true, latency_ms = latency_ms, error = %e,
+                        "Chat completion failed (streaming)"
+                    ),
+                }
+                return other;
+            }
         }
+    }
+
+    // ── Non-streaming: demote to idle after completion (local backends only) ──
+    if active.is_local && active.estimated_vram > 0 {
+        state.vram.demote_to_idle(&active.model_name);
     }
 
     match &result {
@@ -568,21 +581,35 @@ fn auto_select_remote_fallback(
     )))
 }
 
-/// Body wrapper that demotes a model to Idle priority when the stream ends (Drop).
-/// Prevents models from staying at high priority forever after streaming requests.
-struct DemoteOnDropBody {
+/// Body wrapper for streaming responses. When the stream ends OR the client disconnects
+/// (Drop), it reconciles the TPM reservation to the real usage the generator published into
+/// `actual_tokens` (0 if the stream aborted before producing usage → full refund), and
+/// demotes the model to Idle priority (local backends). Doing this in Drop — not in the
+/// generator — guarantees both settle even when the generator is dropped mid-flight.
+struct StreamEndGuard {
     inner: Body,
-    vram: Arc<VramCoordinator>,
-    model: String,
+    rate_limiter: Arc<RateLimiter>,
+    model_key: String,
+    reserved_tokens: u64,
+    actual_tokens: Arc<AtomicU64>,
+    /// `Some((coordinator, model_name))` for local backends that acquired VRAM.
+    vram: Option<(Arc<VramCoordinator>, String)>,
 }
 
-impl DemoteOnDropBody {
-    fn new(inner: Body, vram: Arc<VramCoordinator>, model: String) -> Self {
-        Self { inner, vram, model }
+impl StreamEndGuard {
+    fn new(
+        inner: Body,
+        rate_limiter: Arc<RateLimiter>,
+        model_key: String,
+        reserved_tokens: u64,
+        actual_tokens: Arc<AtomicU64>,
+        vram: Option<(Arc<VramCoordinator>, String)>,
+    ) -> Self {
+        Self { inner, rate_limiter, model_key, reserved_tokens, actual_tokens, vram }
     }
 }
 
-impl http_body::Body for DemoteOnDropBody {
+impl http_body::Body for StreamEndGuard {
     type Data = bytes::Bytes;
     type Error = axum::Error;
 
@@ -604,9 +631,13 @@ impl http_body::Body for DemoteOnDropBody {
     }
 }
 
-impl Drop for DemoteOnDropBody {
+impl Drop for StreamEndGuard {
     fn drop(&mut self) {
-        tracing::debug!(model = %self.model, "Stream ended — demoting to IDLE");
-        self.vram.demote_to_idle(&self.model);
+        let actual = self.actual_tokens.load(Ordering::Relaxed);
+        self.rate_limiter
+            .reconcile_tokens(&self.model_key, self.reserved_tokens, actual);
+        if let Some((vram, model)) = &self.vram {
+            vram.demote_to_idle(model);
+        }
     }
 }
