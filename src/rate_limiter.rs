@@ -243,6 +243,11 @@ struct BackendCircuit {
     /// close the circuit by completing during the half-open window.
     probe_generation: u64,
     active_probe: Option<u64>,
+    /// When the current probe was issued. If a probe is never resolved (e.g. a streaming
+    /// probe whose client disconnects → the generator is dropped before recording an
+    /// outcome), HalfOpen would otherwise be stuck forever. After `recovery_timeout` the
+    /// probe is considered abandoned and a fresh one is issued.
+    probe_started: Option<Instant>,
 }
 
 impl BackendCircuit {
@@ -255,7 +260,18 @@ impl BackendCircuit {
             recovery_timeout: std::time::Duration::from_secs(recovery_timeout_secs),
             probe_generation: 0,
             active_probe: None,
+            probe_started: None,
         }
+    }
+
+    /// Issue a fresh probe (entering or re-entering HalfOpen) and return its token.
+    fn issue_probe(&mut self) -> (bool, Option<u64>) {
+        self.state = CircuitState::HalfOpen;
+        self.probe_generation += 1;
+        self.active_probe = Some(self.probe_generation);
+        self.probe_started = Some(Instant::now());
+        tracing::info!("Circuit breaker → HalfOpen (probe allowed)");
+        (true, self.active_probe)
     }
 
     /// Check if a request should be allowed. Returns `(allowed, probe)` — `probe` is
@@ -269,11 +285,7 @@ impl BackendCircuit {
                 // Check if recovery timeout has elapsed → transition to HalfOpen
                 if let Some(last) = self.last_failure {
                     if last.elapsed() >= self.recovery_timeout {
-                        self.state = CircuitState::HalfOpen;
-                        self.probe_generation += 1;
-                        self.active_probe = Some(self.probe_generation);
-                        tracing::info!("Circuit breaker → HalfOpen (probe allowed)");
-                        (true, self.active_probe)
+                        self.issue_probe()
                     } else {
                         (false, None)
                     }
@@ -283,9 +295,17 @@ impl BackendCircuit {
                 }
             }
             CircuitState::HalfOpen => {
-                // Only one probe request allowed; subsequent requests are rejected.
-                // The probe resolves via record_success / record_failure.
-                (false, None)
+                // Normally only one probe is in flight. But if the outstanding probe was
+                // never resolved (its request's outcome never recorded — e.g. a streaming
+                // probe whose client disconnected, dropping the generator), reissue a probe
+                // after recovery_timeout instead of staying stuck HalfOpen forever.
+                match self.probe_started {
+                    Some(started) if started.elapsed() >= self.recovery_timeout => {
+                        tracing::warn!("Circuit breaker: half-open probe abandoned — reissuing");
+                        self.issue_probe()
+                    }
+                    _ => (false, None),
+                }
             }
         }
     }
@@ -303,6 +323,7 @@ impl BackendCircuit {
                     self.state = CircuitState::Closed;
                     self.consecutive_failures = 0;
                     self.active_probe = None;
+                    self.probe_started = None;
                 }
                 // else: a request that started before the circuit opened just succeeded —
                 // ignore it; only the probe decides recovery.
@@ -323,6 +344,7 @@ impl BackendCircuit {
                 if probe.is_some() && probe == self.active_probe {
                     self.state = CircuitState::Open;
                     self.active_probe = None;
+                    self.probe_started = None;
                     tracing::warn!("Circuit breaker → Open (probe failed)");
                 }
             }
@@ -804,14 +826,39 @@ mod tests {
         assert!(allowed);
         assert!(probe.is_some());
         assert_eq!(cb.state("b1"), "half_open");
-
-        // Second request while half-open should be denied
-        assert!(!cb.allow_request("b1").0);
+        // (A second request within recovery_timeout is denied; not asserted here because the
+        // test uses a 0s timeout, under which the abandoned-probe escape reissues instead —
+        // see test_circuit_breaker_half_open_reissues_abandoned_probe.)
 
         // Probe success (with the probe token) → closed
         cb.record_success("b1", probe);
         assert_eq!(cb.state("b1"), "closed");
         assert!(cb.allow_request("b1").0);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_reissues_abandoned_probe() {
+        // A probe whose outcome is never recorded (e.g. a streaming probe whose client
+        // disconnected, dropping the generator) must not leave the circuit stuck HalfOpen.
+        // With 0s recovery the next request reissues a fresh probe.
+        let cb = CircuitBreaker::new(2, 0, ["b1"].into_iter());
+        cb.record_failure("b1", None);
+        cb.record_failure("b1", None);
+        let (a1, probe1) = cb.allow_request("b1"); // → HalfOpen, probe1
+        assert!(a1);
+        assert_eq!(cb.state("b1"), "half_open");
+
+        // probe1 is never resolved → next request reissues a new probe (not stuck).
+        let (a2, probe2) = cb.allow_request("b1");
+        assert!(a2);
+        assert!(probe2.is_some());
+        assert_ne!(probe1, probe2);
+
+        // A late, stale probe1 outcome is ignored; only the current probe2 resolves it.
+        cb.record_success("b1", probe1);
+        assert_eq!(cb.state("b1"), "half_open");
+        cb.record_success("b1", probe2);
+        assert_eq!(cb.state("b1"), "closed");
     }
 
     #[test]
