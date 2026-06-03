@@ -12,6 +12,7 @@ log_level = "info"
 type = "local"
 base_url = "http://192.168.6.3:11434"
 format = "openai"
+stream_chunk_timeout_secs = 5  # IDEIGLENES (2026-06-03): streaming hiba-ág élő provokálása, utána VISSZA 60-ra/törölni
 
 [backends.anthropic]
 type = "remote"
