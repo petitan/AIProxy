@@ -33,6 +33,12 @@ pub struct RequestStats {
     total_requests: AtomicU64,
 }
 
+impl Default for RequestStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RequestStats {
     pub fn new() -> Self {
         Self {

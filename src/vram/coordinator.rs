@@ -12,6 +12,12 @@ use uuid::Uuid;
 use super::monitor::GpuMonitor;
 use super::ollama::OllamaLifecycle;
 
+/// How often the background reaper scans for and removes expired reservations.
+const RESERVATION_REAPER_INTERVAL_SECS: u64 = 30;
+/// Fallback reservation lifetime, used only if the requested timeout can't be converted to a
+/// chrono duration (practically unreachable — the request timeout is range-validated upstream).
+const RESERVATION_FALLBACK_TTL_SECS: i64 = 300;
+
 /// Priority levels for VRAM allocation (higher = harder to evict)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Priority {
@@ -23,6 +29,9 @@ pub enum Priority {
 }
 
 impl Priority {
+    // `from_str` here is infallible (&str -> Self with a Medium default), not the fallible
+    // `std::str::FromStr` trait — the name is intentional for call-site readability.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "critical" => Priority::Critical,
@@ -308,8 +317,9 @@ impl VramCoordinator {
         AcquireResult::Acquired
     }
 
-    /// Release a model from VRAM tracking (and unload from Ollama)
-    #[allow(dead_code)]
+    /// Release a model from VRAM tracking (and unload from Ollama).
+    /// Currently only exercised by tests — production uses `demote_to_idle` + eviction.
+    #[cfg(test)]
     pub async fn release(&self, client: &Client, model: &str) {
         let existed = self.state.write().slots.remove(model).is_some();
         if existed {
@@ -425,7 +435,8 @@ impl VramCoordinator {
         // Phase 2: Atomically verify budget + register reservation under single lock
         let id = format!("res_{}", Uuid::new_v4().as_simple());
         let expires_at = Utc::now()
-            + chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::seconds(300));
+            + chrono::Duration::from_std(timeout)
+                .unwrap_or(chrono::Duration::seconds(RESERVATION_FALLBACK_TTL_SECS));
 
         {
             let mut state = self.state.write();
@@ -519,7 +530,7 @@ impl VramCoordinator {
     pub fn spawn_reservation_reaper(self: &Arc<Self>) -> AbortHandle {
         let coordinator = Arc::clone(self);
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Duration::from_secs(RESERVATION_REAPER_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 let expired = coordinator.reap_expired();
@@ -552,7 +563,7 @@ impl VramCoordinator {
 
     // ── Private ──────────────────────────────────────────────────
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn register_slot(&self, model: &str, priority: Priority, estimated_vram_mb: u64) {
         let now = Instant::now();
         self.state.write().slots.insert(

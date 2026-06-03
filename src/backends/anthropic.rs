@@ -8,7 +8,7 @@ use crate::config::BackendConfig;
 use crate::error::ProxyError;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
-const DEFAULT_MAX_TOKENS: u64 = 4096;
+use super::DEFAULT_MAX_TOKENS;
 
 // ═══════════════════════════════════════════════════════════════════
 //  OpenAI → Anthropic REQUEST conversion
@@ -80,7 +80,7 @@ fn convert_request(openai_body: &Value) -> Result<Value, ProxyError> {
     if let Some(tools) = openai_body.get("tools").and_then(|v| v.as_array()) {
         let anthropic_tools: Vec<Value> = tools
             .iter()
-            .filter_map(|t| convert_tool_definition(t))
+            .filter_map(convert_tool_definition)
             .collect();
         if !anthropic_tools.is_empty() {
             request["tools"] = Value::Array(anthropic_tools);
@@ -732,27 +732,22 @@ pub async fn chat_completions(
         let error_body = resp.text().await.unwrap_or_default();
         tracing::warn!(status = %status, body = %error_body, "Anthropic returned error");
         // Mask internal error details — log the full body but only expose status to client
-        let error_json = json!({
-            "error": {
-                "message": format!("Backend error ({})", status),
-                "type": "backend_error",
-            }
-        });
-        return Ok(build_json_response(
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            &error_json,
-        ));
+        return Ok(super::masked_error_response(status));
     }
 
     if stream {
-        stream_anthropic_response(resp, &model, include_usage, backend.effective_timeout()).await
+        stream_anthropic_response(resp, &model, include_usage, backend.effective_stream_chunk_timeout()).await
     } else {
         let anthropic_json: Value = resp.json().await.map_err(|e| {
             ProxyError::FormatConversion(format!("Failed to parse Anthropic response: {}", e))
         })?;
 
-        // Extract token usage before converting
+        // Extract token usage before converting. Missing usage is logged (not silently
+        // zeroed) — a 0 here under-counts TPM and could let the rate limit be bypassed.
         let usage = anthropic_json.get("usage");
+        if usage.is_none() {
+            tracing::warn!(model = %model, "Anthropic response has no token usage — TPM accounting may undercount");
+        }
         let input_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
         let output_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -823,12 +818,7 @@ async fn stream_anthropic_response(
                 Ok(bytes) => {
                     raw_buf.extend_from_slice(&bytes);
 
-                    loop {
-                        let newline_pos = match raw_buf.iter().position(|&b| b == b'\n') {
-                            Some(pos) => pos,
-                            None => break,
-                        };
-
+                    while let Some(newline_pos) = raw_buf.iter().position(|&b| b == b'\n') {
                         let mut line_end = newline_pos;
                         if line_end > 0 && raw_buf[line_end - 1] == b'\r' {
                             line_end -= 1;

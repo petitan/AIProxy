@@ -2,6 +2,15 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
+/// Ollama `keep_alive` directive that pins a model in VRAM (proxy-managed lifecycle).
+const KEEP_ALIVE_LOAD: &str = "24h";
+/// Ollama `keep_alive` directive that evicts a model immediately.
+const KEEP_ALIVE_UNLOAD: &str = "0";
+/// Preload can be slow (cold model load from disk) — allow a generous timeout.
+const PRELOAD_TIMEOUT_SECS: u64 = 120;
+/// Unload is cheap — a short timeout is enough.
+const UNLOAD_TIMEOUT_SECS: u64 = 30;
+
 /// Information about a model currently loaded in Ollama
 #[derive(Debug, Clone, Deserialize)]
 pub struct OllamaLoadedModel {
@@ -56,7 +65,7 @@ impl OllamaLifecycle {
         let url = format!("{}/api/generate", self.base_url);
         let body = json!({
             "model": model,
-            "keep_alive": "24h",
+            "keep_alive": KEEP_ALIVE_LOAD,
             "prompt": "",
         });
 
@@ -65,7 +74,7 @@ impl OllamaLifecycle {
         let resp = client
             .post(&url)
             .json(&body)
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(PRELOAD_TIMEOUT_SECS))
             .send()
             .await
             .map_err(|e| format!("Ollama preload failed: {}", e))?;
@@ -75,8 +84,11 @@ impl OllamaLifecycle {
             return Err(format!("Ollama preload returned error: {}", error));
         }
 
-        // Consume the response body (Ollama streams even empty responses)
-        let _ = resp.bytes().await;
+        // Drain the response body (Ollama streams even empty responses). A drain error
+        // doesn't fail the preload, but it's logged rather than silently discarded.
+        if let Err(e) = resp.bytes().await {
+            tracing::warn!(model = %model, error = %e, "Failed to drain Ollama preload response body");
+        }
 
         tracing::info!(model = %model, "Model preloaded");
         Ok(())
@@ -87,7 +99,7 @@ impl OllamaLifecycle {
         let url = format!("{}/api/generate", self.base_url);
         let body = json!({
             "model": model,
-            "keep_alive": "0",
+            "keep_alive": KEEP_ALIVE_UNLOAD,
             "prompt": "",
         });
 
@@ -96,7 +108,7 @@ impl OllamaLifecycle {
         let resp = client
             .post(&url)
             .json(&body)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(UNLOAD_TIMEOUT_SECS))
             .send()
             .await
             .map_err(|e| format!("Ollama unload failed: {}", e))?;
@@ -106,18 +118,11 @@ impl OllamaLifecycle {
             return Err(format!("Ollama unload returned error: {}", error));
         }
 
-        let _ = resp.bytes().await;
+        if let Err(e) = resp.bytes().await {
+            tracing::warn!(model = %model, error = %e, "Failed to drain Ollama unload response body");
+        }
 
         tracing::info!(model = %model, "Model unloaded");
         Ok(())
-    }
-
-    /// Check if a specific model is currently loaded
-    #[allow(dead_code)]
-    pub async fn is_loaded(&self, client: &Client, model: &str) -> bool {
-        match self.loaded_models(client).await {
-            Ok(models) => models.iter().any(|m| m.name == model),
-            Err(_) => false,
-        }
     }
 }

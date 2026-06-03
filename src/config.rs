@@ -23,9 +23,9 @@ pub struct ProxyConfig {
 pub struct ProxySettings {
     #[serde(default = "default_listen")]
     pub listen: String,
-    #[serde(default = "default_log_level")]
-    #[allow(dead_code)]
-    pub log_level: String,
+    // Note: `log_level` is intentionally NOT a field here. It must be read before this struct
+    // is built (logging is set up before config validation), so main.rs reads it via a raw
+    // TOML preview. Serde ignores the unknown `log_level` key, so configs keep working.
     /// Environment variable name containing the proxy API key.
     /// If set, all endpoints (except /health) require `Authorization: Bearer <key>`.
     /// If unset, auth is disabled.
@@ -44,10 +44,6 @@ pub struct ProxySettings {
 
 fn default_listen() -> String {
     "127.0.0.1:8800".to_string()
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
 }
 
 fn default_max_body_size_mb() -> u64 {
@@ -75,6 +71,11 @@ pub struct BackendConfig {
     /// Max retries on transient errors (default: 0 for local, 2 for remote)
     #[serde(default)]
     pub max_retries: Option<u32>,
+    /// Max seconds to wait for a single streaming chunk (default: 60). Must be shorter than
+    /// `timeout_secs`: it bounds the gap *between* chunks, so a stalled backend frees the slot
+    /// quickly instead of holding it for the whole (300s) request timeout.
+    #[serde(default)]
+    pub stream_chunk_timeout_secs: Option<u64>,
 }
 
 impl BackendConfig {
@@ -85,6 +86,12 @@ impl BackendConfig {
             BackendType::Remote => 60,
         });
         std::time::Duration::from_secs(secs)
+    }
+
+    /// Effective per-chunk streaming timeout: explicit config > 60s default.
+    /// Type-independent: the inter-chunk gap should be short regardless of backend.
+    pub fn effective_stream_chunk_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stream_chunk_timeout_secs.unwrap_or(60))
     }
 
     /// Effective max retries: explicit config > type-based default
@@ -253,7 +260,7 @@ impl ProxyConfig {
         }
 
         // Transitive fallback cycle detection (A→B→C→A)
-        for (start_key, _) in &self.models {
+        for start_key in self.models.keys() {
             let mut visited = std::collections::HashSet::new();
             visited.insert(start_key.as_str());
             let mut current = start_key.as_str();
@@ -382,6 +389,31 @@ backend = "anthropic"
         assert_eq!(config.backends["ollama"].effective_timeout().as_secs(), 300);
         // Anthropic: explicit timeout_secs = 30
         assert_eq!(config.backends["anthropic"].effective_timeout().as_secs(), 30);
+    }
+
+    #[test]
+    fn test_effective_stream_chunk_timeout() {
+        let config: ProxyConfig = toml::from_str(sample_toml()).unwrap();
+        // No stream_chunk_timeout_secs configured → 60s default (type-independent)
+        assert_eq!(config.backends["ollama"].effective_stream_chunk_timeout().as_secs(), 60);
+        assert_eq!(config.backends["anthropic"].effective_stream_chunk_timeout().as_secs(), 60);
+
+        // Explicit value honored
+        let toml_str = r#"
+[proxy]
+listen = "127.0.0.1:8800"
+
+[backends.ollama]
+type = "local"
+base_url = "http://localhost:11434"
+stream_chunk_timeout_secs = 15
+
+[models.test]
+name = "test-model"
+backend = "ollama"
+"#;
+        let config: ProxyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backends["ollama"].effective_stream_chunk_timeout().as_secs(), 15);
     }
 
     #[test]

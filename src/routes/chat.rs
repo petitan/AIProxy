@@ -11,8 +11,9 @@ use axum::Json;
 use http_body::Frame;
 use serde_json::Value;
 
+use super::common;
 use crate::backends;
-use crate::backends::TokenUsage;
+use crate::backends::{TokenUsage, DEFAULT_MAX_TOKENS};
 use crate::config::{BackendConfig, BackendType, ModelConfig};
 use crate::error::ProxyError;
 use crate::rate_limiter::RateLimitResult;
@@ -262,7 +263,7 @@ pub async fn chat_completions(
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(4096);
+        .unwrap_or(DEFAULT_MAX_TOKENS);
 
     // ── Forward to backend ──
     let retry_result = backends::dispatch_chat(&state.client, &active.backend_config, body, stream).await;
@@ -271,24 +272,12 @@ pub async fn chat_completions(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     // ── Circuit breaker feedback (on the ACTIVE backend) ──
-    // Record each failed retry attempt as a separate failure
-    for _ in 0..retry_result.failed_attempts {
-        state.circuit_breaker.record_failure(&active.backend_name);
-    }
-    // Record the final result
-    match &result {
-        Ok(resp) if resp.status().is_success() => {
-            state.circuit_breaker.record_success(&active.backend_name);
-        }
-        // 4xx: neutral — don't reset consecutive_failures (prevents CB bypass via crafted 400s)
-        Ok(resp) if resp.status().is_server_error() => {
-            state.circuit_breaker.record_failure(&active.backend_name);
-        }
-        Err(_) => {
-            state.circuit_breaker.record_failure(&active.backend_name);
-        }
-        _ => {}
-    }
+    common::record_cb_outcome(
+        &state.circuit_breaker,
+        &active.backend_name,
+        retry_result.failed_attempts,
+        &result,
+    );
 
     // ── Token usage + metrics reporting (using ACTIVE model key) ──
     if let Ok(ref resp) = result {
@@ -306,15 +295,14 @@ pub async fn chat_completions(
     }
 
     // ── Metrics: request + backend (using ACTIVE names) ──
-    {
-        let is_error = result.as_ref().map_or(true, |r| !r.status().is_success());
-        state.metrics.record_request(&active.model_name, latency_ms, is_error, stream);
-        let (status_code, is_conn_err) = match &result {
-            Ok(resp) => (Some(resp.status().as_u16()), false),
-            Err(_) => (None, true),
-        };
-        state.metrics.record_backend_request(&active.backend_name, status_code, is_conn_err);
-    }
+    common::record_request_metrics(
+        &state.metrics,
+        &active.model_name,
+        &active.backend_name,
+        latency_ms,
+        &result,
+        stream,
+    );
 
     // ── Demote to idle after completion (local backends only) ──
     if active.is_local && active.estimated_vram > 0 {

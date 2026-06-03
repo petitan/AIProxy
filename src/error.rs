@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -60,9 +60,8 @@ impl IntoResponse for ProxyError {
         let mut response = (status, axum::Json(body)).into_response();
 
         if let Some(secs) = retry_after {
-            if let Ok(val) = secs.to_string().parse() {
-                response.headers_mut().insert("retry-after", val);
-            }
+            // `HeaderValue::from(u64)` is infallible — no parse error to swallow.
+            response.headers_mut().insert("retry-after", HeaderValue::from(secs));
         }
 
         response

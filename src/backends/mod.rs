@@ -1,12 +1,18 @@
 pub mod anthropic;
 pub mod ollama;
 
+use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use reqwest::Client;
+use serde_json::json;
 
 use crate::config::{ApiFormat, BackendConfig};
 use crate::error::ProxyError;
+
+/// Default `max_tokens` when a request omits it — shared across backends and the
+/// streaming TPM estimator so the value never diverges between call sites.
+pub const DEFAULT_MAX_TOKENS: u64 = 4096;
 
 /// Token usage extracted from backend responses (non-streaming only).
 /// Attached as a response extension for post-request token rate limiting.
@@ -15,6 +21,27 @@ pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+}
+
+/// Build a masked error response for a failing backend.
+///
+/// The caller is responsible for logging the raw upstream body (which may contain
+/// sensitive details) — this only constructs the client-facing response, exposing
+/// the status code but never the upstream body. Falls back to `502 Bad Gateway`
+/// if the status code is somehow invalid.
+pub fn masked_error_response(status: StatusCode) -> Response {
+    let error_json = json!({
+        "error": {
+            "message": format!("Backend error ({})", status),
+            "type": "backend_error",
+        }
+    });
+    let bytes = serde_json::to_vec(&error_json).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+        .header("content-type", "application/json; charset=utf-8")
+        .body(Body::from(bytes))
+        .expect("valid error response builder")
 }
 
 /// Dispatch a chat completion request to the appropriate backend.

@@ -52,22 +52,11 @@ pub async fn chat_completions(
         let error_body = resp.text().await.unwrap_or_default();
         tracing::warn!(status = %status, body = %error_body, "Ollama backend returned error");
         // Mask internal error details — log the full body but only expose status to client
-        let error_json = json!({
-            "error": {
-                "message": format!("Backend error ({})", status),
-                "type": "backend_error",
-            }
-        });
-        let bytes = serde_json::to_vec(&error_json).unwrap_or_else(|_| b"{}".to_vec());
-        return Ok(Response::builder()
-            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
-            .header("content-type", "application/json; charset=utf-8")
-            .body(Body::from(bytes))
-            .expect("valid error response builder"));
+        return Ok(super::masked_error_response(status));
     }
 
     if stream {
-        Ok(native_stream_to_openai_sse(resp, backend.effective_timeout()))
+        Ok(native_stream_to_openai_sse(resp, backend.effective_stream_chunk_timeout()))
     } else {
         let bytes = resp.bytes().await?;
         let native: Value = serde_json::from_slice(&bytes).map_err(|e| {
@@ -75,7 +64,14 @@ pub async fn chat_completions(
             ProxyError::FormatConversion(format!("Failed to parse Ollama response: {}", e))
         })?;
 
-        // Extract token usage before converting
+        // Extract token usage before converting. Missing usage is logged (not silently
+        // zeroed) — a 0 here under-counts TPM and could let the rate limit be bypassed.
+        if native.get("eval_count").is_none() {
+            tracing::warn!(
+                model = native.get("model").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "Ollama response has no token usage (eval_count) — TPM accounting may undercount"
+            );
+        }
         let prompt_tokens = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let completion_tokens = native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -228,11 +224,44 @@ fn openai_to_native(body: Value, stream: bool) -> Value {
     native
 }
 
-// ─── Response conversion: Ollama native → OpenAI (non-streaming) ──────────
+// ─── Response conversion: Ollama native → OpenAI ──────────────────────────
 
-/// Ollama natív assistant-üzenet → OpenAI alak. Az Ollama tool_calls formátuma
-/// {"function":{"name","arguments":{obj}}} — az OpenAI {"id","type":"function",
-/// "function":{"name","arguments":"<json string>"}}-t vár. Visszaadja az átalakított
+/// Convert a single Ollama native tool_call to OpenAI shape.
+///
+/// Ollama native: `{"id":"call_xxx","function":{"index":0,"name":...,"arguments":{obj}}}`
+/// OpenAI: `{"id","type":"function","function":{"name","arguments":"<json string>"}}`.
+///
+/// - `id`: prefer Ollama's own id (random, globally unique → no multi-turn collisions);
+///   fall back to a positional `call_{i}` only if absent.
+/// - `arguments`: Ollama gives a JSON object → serialized to the OpenAI JSON string.
+/// - `include_index`: streaming deltas require a tool_call `index`; non-streaming omits it.
+fn native_tool_call_to_openai(tc: &Value, i: usize, include_index: bool) -> Value {
+    let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+    let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let args = func.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args_str = if let Some(s) = args.as_str() {
+        s.to_string()
+    } else {
+        serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
+    };
+    let id = tc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("call_{}", i));
+
+    let mut obj = serde_json::Map::new();
+    if include_index {
+        let idx = func.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64);
+        obj.insert("index".to_string(), json!(idx));
+    }
+    obj.insert("id".to_string(), json!(id));
+    obj.insert("type".to_string(), json!("function"));
+    obj.insert("function".to_string(), json!({"name": name, "arguments": args_str}));
+    Value::Object(obj)
+}
+
+/// Ollama natív assistant-üzenet → OpenAI alak (non-streaming). Visszaadja az átalakított
 /// üzenetet és hogy volt-e tool_call.
 fn convert_native_message_to_openai(message: &Value) -> (Value, bool) {
     let mut out = message.clone();
@@ -243,21 +272,7 @@ fn convert_native_message_to_openai(message: &Value) -> (Value, bool) {
             let converted: Vec<Value> = tcs
                 .iter()
                 .enumerate()
-                .map(|(i, tc)| {
-                    let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
-                    let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = func.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    let args_str = if let Some(s) = args.as_str() {
-                        s.to_string()
-                    } else {
-                        serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
-                    };
-                    json!({
-                        "id": format!("call_{}", i),
-                        "type": "function",
-                        "function": {"name": name, "arguments": args_str}
-                    })
-                })
+                .map(|(i, tc)| native_tool_call_to_openai(tc, i, false))
                 .collect();
             if let Some(o) = out.as_object_mut() {
                 o.insert("tool_calls".to_string(), json!(converted));
@@ -335,6 +350,9 @@ fn native_stream_to_openai_sse(
         let mut buffer = Vec::new();
         let mut first_chunk = true;
         let mut model_name = String::from("unknown");
+        // Ollama's `done_reason` is "stop" even when the turn ended on a tool call, so we
+        // track tool emission ourselves to set finish_reason="tool_calls" on the final chunk.
+        let mut has_tool_calls = false;
 
         loop {
             match tokio::time::timeout(chunk_timeout, byte_stream.next()).await {
@@ -370,9 +388,13 @@ fn native_stream_to_openai_sse(
                             let done_reason = native.get("done_reason")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("stop");
-                            let finish_reason = match done_reason {
-                                "length" => "length",
-                                _ => "stop",
+                            let finish_reason = if has_tool_calls {
+                                "tool_calls"
+                            } else {
+                                match done_reason {
+                                    "length" => "length",
+                                    _ => "stop",
+                                }
                             };
 
                             let chunk = json!({
@@ -409,7 +431,26 @@ fn native_stream_to_openai_sse(
                             delta.insert("content".to_string(), json!(content));
                         }
 
-                        // Skip empty chunks (no role, no content)
+                        // Tool calls — Ollama emits them complete (full arguments) in a single
+                        // non-done chunk, not as incremental deltas. Forward as OpenAI tool_call
+                        // deltas (with index) so streaming agents receive the function call.
+                        if let Some(tcs) = native
+                            .get("message")
+                            .and_then(|m| m.get("tool_calls"))
+                            .and_then(|v| v.as_array())
+                        {
+                            if !tcs.is_empty() {
+                                let converted: Vec<Value> = tcs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, tc)| native_tool_call_to_openai(tc, i, true))
+                                    .collect();
+                                delta.insert("tool_calls".to_string(), json!(converted));
+                                has_tool_calls = true;
+                            }
+                        }
+
+                        // Skip empty chunks (no role, no content, no tool_calls)
                         if delta.is_empty() {
                             continue;
                         }
@@ -442,9 +483,17 @@ fn native_stream_to_openai_sse(
                         let remaining = String::from_utf8_lossy(&buffer).trim().to_string();
                         if let Ok(native) = serde_json::from_str::<Value>(&remaining) {
                             if native.get("done").and_then(|v| v.as_bool()) == Some(true) {
-                                let finish_reason = native.get("done_reason")
+                                let done_reason = native.get("done_reason")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("stop");
+                                let finish_reason = if has_tool_calls {
+                                    "tool_calls"
+                                } else {
+                                    match done_reason {
+                                        "length" => "length",
+                                        _ => "stop",
+                                    }
+                                };
                                 let chunk = json!({
                                     "id": &chat_id,
                                     "object": "chat.completion.chunk",

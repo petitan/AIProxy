@@ -6,6 +6,7 @@ use axum::response::Response;
 use axum::Json;
 use serde_json::Value;
 
+use super::common;
 use crate::backends;
 use crate::backends::TokenUsage;
 use crate::config::BackendType;
@@ -128,24 +129,12 @@ pub async fn create_embeddings(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     // ── Circuit breaker feedback ──
-    // Record each failed retry attempt as a separate failure
-    for _ in 0..retry_result.failed_attempts {
-        state.circuit_breaker.record_failure(&backend_name);
-    }
-    // Record the final result
-    match &result {
-        Ok(resp) if resp.status().is_success() => {
-            state.circuit_breaker.record_success(&backend_name);
-        }
-        // 4xx: neutral — don't reset consecutive_failures (prevents CB bypass via crafted 400s)
-        Ok(resp) if resp.status().is_server_error() => {
-            state.circuit_breaker.record_failure(&backend_name);
-        }
-        Err(_) => {
-            state.circuit_breaker.record_failure(&backend_name);
-        }
-        _ => {}
-    }
+    common::record_cb_outcome(
+        &state.circuit_breaker,
+        &backend_name,
+        retry_result.failed_attempts,
+        &result,
+    );
 
     // ── Token usage + metrics reporting ──
     if let Ok(ref resp) = result {
@@ -156,15 +145,14 @@ pub async fn create_embeddings(
     }
 
     // ── Metrics: request + backend ──
-    {
-        let is_error = result.as_ref().map_or(true, |r| !r.status().is_success());
-        state.metrics.record_request(&model_name, latency_ms, is_error, false);
-        let (status_code, is_conn_err) = match &result {
-            Ok(resp) => (Some(resp.status().as_u16()), false),
-            Err(_) => (None, true),
-        };
-        state.metrics.record_backend_request(&backend_name, status_code, is_conn_err);
-    }
+    common::record_request_metrics(
+        &state.metrics,
+        &model_name,
+        &backend_name,
+        latency_ms,
+        &result,
+        false,
+    );
 
     // ── Demote to idle after completion (local backends only) ──
     if is_local && estimated_vram > 0 {

@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    for (_key, model) in &config.models {
+    for model in config.models.values() {
         tracing::info!(
             model = %model.name,
             backend = %model.backend,

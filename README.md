@@ -167,6 +167,12 @@ reranker = { estimated_vram_mb = 800 }  # Always reserved (e.g. Flask reranker)
 
 VRAM budget = `total_vram_mb - overhead_mb - permanent_reservations`
 
+> **Known limitation — budget is estimate-based.** Acquire/eviction decisions use the configured
+> `estimated_vram_mb` per model, **not** the GPU's real free VRAM. Actual free VRAM is read only
+> for the `/status` endpoint (and NVML is unavailable on WSL2). If an estimate is too low (e.g. a
+> large KV-cache pushes real usage above the estimate), the coordinator may admit a model that
+> then OOMs. Set `estimated_vram_mb` conservatively (round up).
+
 ### Priority levels
 
 | Priority | Evictable by | Typical use |
@@ -400,6 +406,28 @@ AIProxy automatically converts between OpenAI and Anthropic message formats. Cli
 | Consecutive role merge | Auto-merged for Anthropic's alternating role requirement |
 
 **Not proxied** (Anthropic doesn't support): `frequency_penalty`, `presence_penalty`, `logprobs`, `seed`, `logit_bias`
+
+---
+
+## Ollama Function Calling (Tools)
+
+Ollama models are served through Ollama's **native** `/api/chat` endpoint (not the OpenAI-compat
+layer, which ignores `think` in streaming). The proxy converts tool/function-calling in both
+directions so OpenAI-SDK clients and agent frameworks work unchanged.
+
+| Feature | Support |
+|---------|---------|
+| Tool definitions | OpenAI `tools` forwarded as-is (Ollama native accepts the same shape) |
+| Tool calls (response) | Ollama `tool_calls` -> OpenAI `tool_calls`; `arguments` object -> JSON string |
+| Tool call IDs | Ollama's own `id` is preserved (globally unique → safe across multi-turn) |
+| Tool results | `tool` role + `tool_call_id` -> Ollama native `tool_name` (resolved via the request's id→name map) |
+| Assistant tool turns | OpenAI `tool_calls` (string args) -> Ollama native (object args) on the way back in |
+| finish_reason | `tool_calls` when a tool was called (Ollama's `done_reason` stays `"stop"`, so the proxy tracks tool emission itself) |
+| **Streaming (SSE)** | **Full** — tool calls are forwarded as OpenAI `delta.tool_calls` with `index`, and the final chunk carries `finish_reason: "tool_calls"` |
+
+> Streaming note: Ollama emits a tool call complete (full arguments) in a single chunk, not as
+> incremental deltas — the proxy forwards it as one OpenAI tool_call delta. Both streaming and
+> non-streaming paths share the same conversion, so they never diverge.
 
 ---
 
@@ -756,7 +784,8 @@ type = "local"                          # "local" or "remote"
 base_url = "http://localhost:11434"     # Must start with http:// or https://
 format = "openai"                       # "openai" or "anthropic"
 # api_key_env = "..."                   # Env var for backend API key
-# timeout_secs = 300                    # Default: 300 (local), 60 (remote)
+# timeout_secs = 300                    # Default: 300 (local), 60 (remote) — whole-request timeout
+# stream_chunk_timeout_secs = 60        # Default: 60 — max gap between streaming chunks
 # max_retries = 0                       # Default: 0 (local), 2 (remote)
 
 [backends.anthropic]

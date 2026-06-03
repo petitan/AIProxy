@@ -35,7 +35,9 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
             Err(_) => ("unknown".to_string(), "error"), // Fix #2: JoinError → error status
         };
 
-        if status != "ok" {
+        // "configured" = remote backend with a present API key — healthy, but not
+        // API-verified (we don't call the paid endpoint just for /health).
+        if status != "ok" && status != "configured" {
             all_ok = false;
         }
 
@@ -63,17 +65,19 @@ async fn check_local_backend(client: &reqwest::Client, base_url: &str) -> &'stat
     }
 }
 
-/// Check remote backend: API key env var exists (don't call the API)
+/// Check remote backend: only verifies the API key env var is present — it does NOT call
+/// the (paid) API. Returns "configured" rather than "ok" so the status doesn't overstate
+/// what was checked; "misconfigured" if the configured env var is missing.
 fn check_remote_backend(backend: &crate::config::BackendConfig) -> &'static str {
     match &backend.api_key_env {
         Some(env_var) => {
             if std::env::var(env_var).is_ok() {
-                "ok"
+                "configured"
             } else {
                 "misconfigured"
             }
         }
-        None => "ok",
+        None => "configured",
     }
 }
 
