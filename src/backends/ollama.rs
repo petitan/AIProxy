@@ -4,9 +4,11 @@ use axum::response::Response;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::BackendConfig;
 use crate::error::ProxyError;
+use crate::rate_limiter::CircuitBreaker;
 
 /// Forward chat completions to Ollama using the **native** `/api/chat` endpoint.
 ///
@@ -23,6 +25,8 @@ pub async fn chat_completions(
     backend: &BackendConfig,
     body: Value,
     stream: bool,
+    circuit_breaker: Arc<CircuitBreaker>,
+    backend_name: String,
 ) -> Result<Response, ProxyError> {
     let url = format!("{}/api/chat", backend.base_url.trim_end_matches('/'));
     let native_body = openai_to_native(body, stream);
@@ -56,13 +60,29 @@ pub async fn chat_completions(
     }
 
     if stream {
-        Ok(native_stream_to_openai_sse(resp, backend.effective_stream_chunk_timeout()))
+        Ok(native_stream_to_openai_sse(
+            resp,
+            backend.effective_stream_chunk_timeout(),
+            circuit_breaker,
+            backend_name,
+        ))
     } else {
         let bytes = resp.bytes().await?;
         let native: Value = serde_json::from_slice(&bytes).map_err(|e| {
             tracing::error!(error = %e, "Failed to parse Ollama response JSON");
             ProxyError::FormatConversion(format!("Failed to parse Ollama response: {}", e))
         })?;
+
+        // A 200 body that parses as JSON but carries no `message` is not a completion
+        // (e.g. {"error":...} or an empty object). Surface it explicitly with the raw body
+        // logged, instead of falling back to a silent empty assistant message.
+        if native.get("message").is_none() {
+            let raw = String::from_utf8_lossy(&bytes);
+            tracing::error!(body = %raw, "Ollama 200 response has no 'message' field — not a valid completion");
+            return Err(ProxyError::FormatConversion(
+                "Ollama returned a 200 response without a completion message".to_string(),
+            ));
+        }
 
         // Extract token usage before converting. Missing usage is logged (not silently
         // zeroed) — a 0 here under-counts TPM and could let the rate limit be bypassed.
@@ -339,6 +359,8 @@ fn native_to_openai_response(native: &Value) -> Value {
 fn native_stream_to_openai_sse(
     upstream: reqwest::Response,
     chunk_timeout: std::time::Duration,
+    circuit_breaker: Arc<CircuitBreaker>,
+    backend_name: String,
 ) -> Response {
     let byte_stream = upstream.bytes_stream();
     let chat_id = format!("chatcmpl-{}", unix_timestamp());
@@ -353,6 +375,11 @@ fn native_stream_to_openai_sse(
         // Ollama's `done_reason` is "stop" even when the turn ended on a tool call, so we
         // track tool emission ourselves to set finish_reason="tool_calls" on the final chunk.
         let mut has_tool_calls = false;
+        // Track whether we ever emitted a finish_reason chunk. If the stream ends, errors,
+        // or times out before a `done` chunk, we must surface an explicit error to the client
+        // instead of a silent empty `[DONE]` (otherwise a non-NDJSON/empty 200 upstream body
+        // looks like a successful empty completion — silent fallback).
+        let mut emitted_finish = false;
 
         loop {
             match tokio::time::timeout(chunk_timeout, byte_stream.next()).await {
@@ -413,6 +440,8 @@ fn native_stream_to_openai_sse(
                                 bytes::Bytes::from(format!("data: {}\n\n", chunk))
                             );
                             yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+                            // Stream completed cleanly — the backend is healthy.
+                            circuit_breaker.record_success(&backend_name);
                             return;
                         }
 
@@ -474,7 +503,15 @@ fn native_stream_to_openai_sse(
                 }
                 Ok(Some(Err(e))) => {
                     tracing::error!(error = %e, "Error reading Ollama native stream");
+                    if !emitted_finish {
+                        yield Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            json!({"error": {"message": format!("upstream stream error: {}", e), "type": "upstream_error"}})
+                        )));
+                    }
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+                    // Stream broke before completion — count it against the backend.
+                    circuit_breaker.record_failure(&backend_name);
                     break;
                 }
                 Ok(None) => {
@@ -508,10 +545,27 @@ fn native_stream_to_openai_sse(
                                 yield Ok::<_, std::io::Error>(
                                     bytes::Bytes::from(format!("data: {}\n\n", chunk))
                                 );
+                                emitted_finish = true;
                             }
                         }
                     }
+                    // Stream ended without a valid `done` chunk → the upstream 200 body was
+                    // not a complete NDJSON completion (empty / non-JSON / {"error":...}).
+                    // Surface it explicitly with the raw body logged, not a silent empty [DONE].
+                    if !emitted_finish {
+                        let raw = String::from_utf8_lossy(&buffer);
+                        tracing::error!(buffer = %raw, "Ollama stream ended without a valid completion (no done chunk)");
+                        yield Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            json!({"error": {"message": "upstream returned no valid completion", "type": "upstream_error"}})
+                        )));
+                    }
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+                    if emitted_finish {
+                        circuit_breaker.record_success(&backend_name);
+                    } else {
+                        circuit_breaker.record_failure(&backend_name);
+                    }
                     break;
                 }
                 Err(_elapsed) => {
@@ -519,7 +573,15 @@ fn native_stream_to_openai_sse(
                         timeout_secs = chunk_timeout.as_secs(),
                         "Ollama native stream chunk timed out"
                     );
+                    if !emitted_finish {
+                        yield Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            json!({"error": {"message": format!("upstream stream chunk timeout after {}s", chunk_timeout.as_secs()), "type": "upstream_timeout"}})
+                        )));
+                    }
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+                    // A chunk timeout is a backend health signal — count it as a failure.
+                    circuit_breaker.record_failure(&backend_name);
                     break;
                 }
             }

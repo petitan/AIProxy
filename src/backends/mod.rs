@@ -1,6 +1,8 @@
 pub mod anthropic;
 pub mod ollama;
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -9,6 +11,7 @@ use serde_json::json;
 
 use crate::config::{ApiFormat, BackendConfig};
 use crate::error::ProxyError;
+use crate::rate_limiter::CircuitBreaker;
 
 /// Default `max_tokens` when a request omits it — shared across backends and the
 /// streaming TPM estimator so the value never diverges between call sites.
@@ -52,13 +55,21 @@ pub async fn dispatch_chat(
     backend: &BackendConfig,
     body: serde_json::Value,
     stream: bool,
+    circuit_breaker: &Arc<CircuitBreaker>,
+    backend_name: &str,
 ) -> RetryResult {
     let max_retries = if stream { 0 } else { backend.effective_max_retries() };
 
     with_retry(max_retries, &backend.base_url, || async {
         match backend.format {
-            ApiFormat::OpenAI => ollama::chat_completions(client, backend, body.clone(), stream).await,
-            ApiFormat::Anthropic => anthropic::chat_completions(client, backend, body.clone(), stream).await,
+            ApiFormat::OpenAI => ollama::chat_completions(
+                client, backend, body.clone(), stream,
+                circuit_breaker.clone(), backend_name.to_string(),
+            ).await,
+            ApiFormat::Anthropic => anthropic::chat_completions(
+                client, backend, body.clone(), stream,
+                circuit_breaker.clone(), backend_name.to_string(),
+            ).await,
         }
     }).await
 }

@@ -144,6 +144,11 @@ pub fn build_router(config: ProxyConfig) -> Router {
     // which is the desired behavior (graceful shutdown aborts all spawned tasks).
     let _reaper_handle = vram_arc.spawn_reservation_reaper();
 
+    // Spawn periodic Ollama sync — keeps coordinator slots in step with Ollama's actually
+    // loaded models (prunes phantom slots Ollama unloaded on its own keep_alive timeout).
+    // Without this the coordinator only synced once at startup and over-booked VRAM.
+    let _ollama_sync_handle = vram_arc.spawn_ollama_sync(client.clone());
+
     let rate_limiter = RateLimiter::new(&config.rate_limits);
     let circuit_breaker = CircuitBreaker::new(
         config.circuit_breaker.failure_threshold,

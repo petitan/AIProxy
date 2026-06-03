@@ -14,6 +14,8 @@ use super::ollama::OllamaLifecycle;
 
 /// How often the background reaper scans for and removes expired reservations.
 const RESERVATION_REAPER_INTERVAL_SECS: u64 = 30;
+/// How often the coordinator re-syncs its slots with Ollama's actually-loaded models.
+const OLLAMA_SYNC_INTERVAL_SECS: u64 = 30;
 /// Fallback reservation lifetime, used only if the requested timeout can't be converted to a
 /// chrono duration (practically unreachable — the request timeout is range-validated upstream).
 const RESERVATION_FALLBACK_TTL_SECS: i64 = 300;
@@ -347,7 +349,11 @@ impl VramCoordinator {
 
         match ollama.loaded_models(client).await {
             Ok(loaded) => {
+                let loaded_names: std::collections::HashSet<&str> =
+                    loaded.iter().map(|m| m.name.as_str()).collect();
                 let mut state = self.state.write();
+
+                // 1) Register models Ollama reports but the coordinator doesn't track yet.
                 for model in &loaded {
                     let full_name = &model.name;
                     if !state.slots.contains_key(full_name) {
@@ -366,6 +372,29 @@ impl VramCoordinator {
                                 loaded_at: Instant::now(),
                                 last_used: Instant::now(),
                             },
+                        );
+                    }
+                }
+
+                // 2) Prune phantom slots: models the coordinator still books but Ollama no
+                // longer reports as loaded (e.g. Ollama unloaded them on its own keep_alive
+                // timeout). Only IDLE slots are pruned — a non-Idle slot is serving an
+                // in-flight request or being preloaded, so it must never be removed here,
+                // even in the brief window before Ollama lists it.
+                let stale: Vec<String> = state
+                    .slots
+                    .iter()
+                    .filter(|(name, slot)| {
+                        slot.priority == Priority::Idle && !loaded_names.contains(name.as_str())
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                for name in stale {
+                    if let Some(slot) = state.slots.remove(&name) {
+                        tracing::info!(
+                            model = %name,
+                            vram_mb = slot.estimated_vram_mb,
+                            "Pruned phantom VRAM slot — Ollama no longer reports it as loaded"
                         );
                     }
                 }
@@ -537,6 +566,24 @@ impl VramCoordinator {
                 if !expired.is_empty() {
                     tracing::info!(count = expired.len(), "Reaped expired reservations");
                 }
+            }
+        });
+        handle.abort_handle()
+    }
+
+    /// Spawn background task that re-syncs coordinator slots with Ollama's actual loaded
+    /// models every 30 seconds. Bidirectional: registers models Ollama reports but we don't
+    /// track, and prunes phantom IDLE slots Ollama no longer reports. Without this the
+    /// coordinator only ever learned Ollama's state once at startup, so models Ollama
+    /// unloaded on its own keep_alive timeout stayed booked forever (phantom VRAM).
+    /// Returns an AbortHandle that can be used to stop the task on shutdown.
+    pub fn spawn_ollama_sync(self: &Arc<Self>, client: Client) -> AbortHandle {
+        let coordinator = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(OLLAMA_SYNC_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                coordinator.sync_with_ollama(&client).await;
             }
         });
         handle.abort_handle()

@@ -266,7 +266,14 @@ pub async fn chat_completions(
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     // ── Forward to backend ──
-    let retry_result = backends::dispatch_chat(&state.client, &active.backend_config, body, stream).await;
+    let retry_result = backends::dispatch_chat(
+        &state.client,
+        &active.backend_config,
+        body,
+        stream,
+        &state.circuit_breaker,
+        &active.backend_name,
+    ).await;
     let result = retry_result.result;
 
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -277,6 +284,7 @@ pub async fn chat_completions(
         &active.backend_name,
         retry_result.failed_attempts,
         &result,
+        stream,
     );
 
     // ── Token usage + metrics reporting (using ACTIVE model key) ──

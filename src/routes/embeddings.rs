@@ -134,6 +134,7 @@ pub async fn create_embeddings(
         &backend_name,
         retry_result.failed_attempts,
         &result,
+        false, // embeddings never stream
     );
 
     // ── Token usage + metrics reporting ──

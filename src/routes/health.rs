@@ -152,8 +152,18 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
         });
     }
 
+    // Derive the top-level status from the circuit breakers instead of a static "ok".
+    // A "closed" status on every backend means no backend has tripped; any open/half_open
+    // circuit means a backend is failing, so the overall status is "degraded". This stops
+    // /status reporting "ok" while inference is actually down.
+    let any_circuit_unhealthy = state
+        .config
+        .backends
+        .keys()
+        .any(|name| state.circuit_breaker.state(name) != "closed");
+
     Json(json!({
-        "status": "ok",
+        "status": if any_circuit_unhealthy { "degraded" } else { "ok" },
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": state.started_at.elapsed().as_secs(),
         "backends": backends,
