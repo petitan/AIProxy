@@ -143,10 +143,18 @@ impl RateLimiter {
         }
     }
 
-    /// Pre-request check: verify both RPM and TPM limits.
-    /// RPM consumes 1 token per request — but ONLY if TPM also passes (atomic check).
-    /// TPM only checks admission (tokens > 0), actual deduction happens post-request.
-    pub fn check(&self, model_key: &str) -> RateLimitResult {
+    /// Pre-request check: verify RPM, then admit + **pre-reserve** the estimated TPM.
+    ///
+    /// `estimated_tokens` (the request's max_tokens, or a default) is pre-deducted from
+    /// the TPM bucket at admission so concurrent requests can't all slip through while the
+    /// budget is ~0 (the old non-consuming admission check allowed exactly that burst
+    /// bypass). The reservation is corrected to the real usage post-request via
+    /// `reconcile_tokens`. Admission is gated on `has_capacity` (>= 1 token) rather than
+    /// `try_acquire(estimated)`, so a large estimate can't permanently deny a model whose
+    /// budget is smaller than the estimate.
+    ///
+    /// Locks are taken one at a time (never RPM and TPM simultaneously) — no deadlock.
+    pub fn check(&self, model_key: &str, estimated_tokens: u64) -> RateLimitResult {
         let rpm_bucket = self
             .rpm_buckets
             .get(model_key)
@@ -157,45 +165,52 @@ impl RateLimiter {
             .get(model_key)
             .or(self.default_tpm.as_ref());
 
-        // Phase 1: Check TPM admission first (non-consuming check)
-        if let Some(bucket) = tpm_bucket {
-            let mut bucket = bucket.lock();
-            if let Err(retry_after_secs) = bucket.has_capacity() {
+        // Phase 1: check + consume RPM (1 token).
+        if let Some(bucket) = rpm_bucket {
+            let mut b = bucket.lock();
+            if let Err(retry_after_secs) = b.try_acquire(1.0) {
                 return RateLimitResult::Denied { retry_after_secs };
             }
         }
 
-        // Phase 2: Check + consume RPM (only if TPM passed)
-        if let Some(bucket) = rpm_bucket {
-            let mut bucket = bucket.lock();
-            if let Err(retry_after_secs) = bucket.try_acquire(1.0) {
+        // Phase 2: TPM admission gate, then pre-reserve the estimate.
+        if let Some(bucket) = tpm_bucket {
+            let mut b = bucket.lock();
+            if let Err(retry_after_secs) = b.has_capacity() {
+                drop(b);
+                // Refund the RPM token we already took for this now-denied request.
+                if let Some(rb) = rpm_bucket {
+                    rb.lock().consume(-1.0);
+                }
                 return RateLimitResult::Denied { retry_after_secs };
             }
+            b.consume(estimated_tokens as f64);
         }
 
         RateLimitResult::Allowed
     }
 
-    /// Post-request: report actual token usage for TPM accounting.
-    /// Called after a successful response with known token count.
-    pub fn report_tokens(&self, model_key: &str, tokens: u64) {
-        if tokens == 0 {
+    /// Reconcile a pre-reserved TPM estimate against the real usage. `delta = actual -
+    /// reserved` is applied: a positive delta deducts the overflow, a negative delta
+    /// refunds the unused reservation. Call exactly once per admitted request (with
+    /// `actual = 0` to fully refund a request that failed before producing usage).
+    pub fn reconcile_tokens(&self, model_key: &str, reserved: u64, actual: u64) {
+        let delta = actual as i64 - reserved as i64;
+        if delta == 0 {
             return;
         }
-
         let tpm_bucket = self
             .tpm_buckets
             .get(model_key)
             .or(self.default_tpm.as_ref());
-
         if let Some(bucket) = tpm_bucket {
-            let mut bucket = bucket.lock();
-            let remaining = bucket.consume(tokens as f64);
+            let remaining = bucket.lock().consume(delta as f64);
             tracing::debug!(
                 model = %model_key,
-                tokens = tokens,
+                reserved = reserved,
+                actual = actual,
                 remaining = remaining as i64,
-                "Token usage reported"
+                "TPM reservation reconciled"
             );
         }
     }
@@ -222,6 +237,12 @@ struct BackendCircuit {
     failure_threshold: u32,
     last_failure: Option<Instant>,
     recovery_timeout: std::time::Duration,
+    /// Monotonic counter incremented each time the circuit enters HalfOpen, identifying
+    /// the current probe. `record_*` only transitions state when the outcome carries the
+    /// matching probe token — so a request that started BEFORE the circuit opened can't
+    /// close the circuit by completing during the half-open window.
+    probe_generation: u64,
+    active_probe: Option<u64>,
 }
 
 impl BackendCircuit {
@@ -232,60 +253,81 @@ impl BackendCircuit {
             failure_threshold,
             last_failure: None,
             recovery_timeout: std::time::Duration::from_secs(recovery_timeout_secs),
+            probe_generation: 0,
+            active_probe: None,
         }
     }
 
-    /// Check if a request should be allowed through
-    fn allow_request(&mut self) -> bool {
+    /// Check if a request should be allowed. Returns `(allowed, probe)` — `probe` is
+    /// `Some(token)` only when this request is the half-open probe; the caller must pass
+    /// that token back to `record_success`/`record_failure` so only the probe's own
+    /// outcome moves the circuit.
+    fn allow_request(&mut self) -> (bool, Option<u64>) {
         match self.state {
-            CircuitState::Closed => true,
+            CircuitState::Closed => (true, None),
             CircuitState::Open => {
                 // Check if recovery timeout has elapsed → transition to HalfOpen
                 if let Some(last) = self.last_failure {
                     if last.elapsed() >= self.recovery_timeout {
                         self.state = CircuitState::HalfOpen;
+                        self.probe_generation += 1;
+                        self.active_probe = Some(self.probe_generation);
                         tracing::info!("Circuit breaker → HalfOpen (probe allowed)");
-                        true
+                        (true, self.active_probe)
                     } else {
-                        false
+                        (false, None)
                     }
                 } else {
                     // No last_failure recorded (shouldn't happen), allow
-                    true
+                    (true, None)
                 }
             }
             CircuitState::HalfOpen => {
-                // Only one probe request allowed; subsequent requests are rejected
-                // The probe will resolve via record_success or record_failure
-                false
+                // Only one probe request allowed; subsequent requests are rejected.
+                // The probe resolves via record_success / record_failure.
+                (false, None)
             }
         }
     }
 
-    /// Record a successful response → close the circuit
-    fn record_success(&mut self) {
-        if self.state != CircuitState::Closed {
-            tracing::info!(
-                previous_state = ?self.state,
-                "Circuit breaker → Closed (backend recovered)"
-            );
+    /// Record a successful response. `probe` is the token from `allow_request` (None for a
+    /// non-probe request). In HalfOpen only the probe's own success closes the circuit.
+    fn record_success(&mut self, probe: Option<u64>) {
+        match self.state {
+            CircuitState::Closed => {
+                self.consecutive_failures = 0;
+            }
+            CircuitState::HalfOpen => {
+                if probe.is_some() && probe == self.active_probe {
+                    tracing::info!("Circuit breaker → Closed (probe succeeded)");
+                    self.state = CircuitState::Closed;
+                    self.consecutive_failures = 0;
+                    self.active_probe = None;
+                }
+                // else: a request that started before the circuit opened just succeeded —
+                // ignore it; only the probe decides recovery.
+            }
+            CircuitState::Open => {
+                // Stray success while open (raced with opening) — ignore.
+            }
         }
-        self.state = CircuitState::Closed;
-        self.consecutive_failures = 0;
     }
 
-    /// Record a failure → potentially open the circuit
-    fn record_failure(&mut self) {
-        self.consecutive_failures += 1;
+    /// Record a failure. `probe` is the token from `allow_request`. In HalfOpen only the
+    /// probe's own failure reopens the circuit; a stray old request's failure is ignored.
+    fn record_failure(&mut self, probe: Option<u64>) {
         self.last_failure = Some(Instant::now());
 
         match self.state {
             CircuitState::HalfOpen => {
-                // Probe failed → back to Open
-                self.state = CircuitState::Open;
-                tracing::warn!("Circuit breaker → Open (probe failed)");
+                if probe.is_some() && probe == self.active_probe {
+                    self.state = CircuitState::Open;
+                    self.active_probe = None;
+                    tracing::warn!("Circuit breaker → Open (probe failed)");
+                }
             }
             CircuitState::Closed => {
+                self.consecutive_failures += 1;
                 if self.consecutive_failures >= self.failure_threshold {
                     self.state = CircuitState::Open;
                     tracing::warn!(
@@ -338,34 +380,36 @@ impl CircuitBreaker {
         }
     }
 
-    /// Check if a request to this backend should be allowed.
-    /// Returns true if allowed, false if circuit is open. An unknown backend name
-    /// (not pre-populated from config) is allowed fail-safe and logged — it must not
-    /// silently create a new circuit (that's what let the map grow unbounded).
-    pub fn allow_request(&self, backend_name: &str) -> bool {
+    /// Check if a request to this backend should be allowed. Returns `(allowed, probe)`:
+    /// `probe` is `Some(token)` when this request is the half-open probe and must be passed
+    /// back to `record_success`/`record_failure`. An unknown backend name (not pre-populated
+    /// from config) is allowed fail-safe and logged — it must not silently create a new
+    /// circuit (that's what let the map grow unbounded).
+    pub fn allow_request(&self, backend_name: &str) -> (bool, Option<u64>) {
         let mut circuits = self.circuits.lock();
         match circuits.get_mut(backend_name) {
             Some(circuit) => circuit.allow_request(),
             None => {
                 tracing::warn!(backend = %backend_name, "Circuit breaker: unknown backend — allowing (fail-safe)");
-                true
+                (true, None)
             }
         }
     }
 
-    /// Record a successful response for a backend
-    pub fn record_success(&self, backend_name: &str) {
+    /// Record a successful response for a backend. `probe` is the token from `allow_request`
+    /// (None for a non-probe request).
+    pub fn record_success(&self, backend_name: &str, probe: Option<u64>) {
         let mut circuits = self.circuits.lock();
         if let Some(circuit) = circuits.get_mut(backend_name) {
-            circuit.record_success();
+            circuit.record_success(probe);
         }
     }
 
-    /// Record a failure for a backend
-    pub fn record_failure(&self, backend_name: &str) {
+    /// Record a failure for a backend. `probe` is the token from `allow_request`.
+    pub fn record_failure(&self, backend_name: &str, probe: Option<u64>) {
         let mut circuits = self.circuits.lock();
         match circuits.get_mut(backend_name) {
-            Some(circuit) => circuit.record_failure(),
+            Some(circuit) => circuit.record_failure(probe),
             None => {
                 tracing::warn!(backend = %backend_name, "Circuit breaker: failure for unknown backend — ignored");
             }
@@ -395,7 +439,7 @@ mod tests {
     #[test]
     fn test_no_limits_configured() {
         let limiter = RateLimiter::new(&HashMap::new());
-        assert!(matches!(limiter.check("anything"), RateLimitResult::Allowed));
+        assert!(matches!(limiter.check("anything", 0), RateLimitResult::Allowed));
     }
 
     #[test]
@@ -412,7 +456,7 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         for _ in 0..10 {
-            assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+            assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
         }
     }
 
@@ -430,10 +474,10 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         for _ in 0..3 {
-            assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+            assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
         }
 
-        match limiter.check("claude") {
+        match limiter.check("claude", 0) {
             RateLimitResult::Denied { retry_after_secs } => {
                 assert!(retry_after_secs > 0.0);
                 assert!(retry_after_secs <= 20.0);
@@ -457,13 +501,13 @@ mod tests {
 
         for _ in 0..5 {
             assert!(matches!(
-                limiter.check("unknown_model"),
+                limiter.check("unknown_model", 0),
                 RateLimitResult::Allowed
             ));
         }
 
         assert!(matches!(
-            limiter.check("unknown_model"),
+            limiter.check("unknown_model", 0),
             RateLimitResult::Denied { .. }
         ));
     }
@@ -490,19 +534,19 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         for _ in 0..50 {
-            assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+            assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
         }
 
         assert!(matches!(
-            limiter.check("other_model"),
+            limiter.check("other_model", 0),
             RateLimitResult::Allowed
         ));
         assert!(matches!(
-            limiter.check("other_model"),
+            limiter.check("other_model", 0),
             RateLimitResult::Allowed
         ));
         assert!(matches!(
-            limiter.check("other_model"),
+            limiter.check("other_model", 0),
             RateLimitResult::Denied { .. }
         ));
     }
@@ -519,7 +563,7 @@ mod tests {
             },
         );
         let limiter = RateLimiter::new(&limits);
-        assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+        assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
     }
 
     #[test]
@@ -536,10 +580,10 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         for _ in 0..60 {
-            limiter.check("test");
+            limiter.check("test", 0);
         }
 
-        match limiter.check("test") {
+        match limiter.check("test", 0) {
             RateLimitResult::Denied { retry_after_secs } => {
                 assert!(retry_after_secs > 0.0);
                 assert!(retry_after_secs <= 2.0);
@@ -561,7 +605,7 @@ mod tests {
         );
         let limiter = RateLimiter::new(&limits);
         for _ in 0..100 {
-            assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+            assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
         }
     }
 
@@ -581,18 +625,18 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         // Should be allowed initially
-        assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+        assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
 
         // Consume most of the budget
-        limiter.report_tokens("claude", 999);
+        limiter.reconcile_tokens("claude", 0, 999);
         // Still allowed (1 token left)
-        assert!(matches!(limiter.check("claude"), RateLimitResult::Allowed));
+        assert!(matches!(limiter.check("claude", 0), RateLimitResult::Allowed));
 
         // Consume more → goes negative
-        limiter.report_tokens("claude", 100);
+        limiter.reconcile_tokens("claude", 0, 100);
         // Now should be denied
         assert!(matches!(
-            limiter.check("claude"),
+            limiter.check("claude", 0),
             RateLimitResult::Denied { .. }
         ));
     }
@@ -609,6 +653,41 @@ mod tests {
         assert_eq!(b.tokens, 1000.0);
     }
 
+    fn tpm_limiter(tpm: u32) -> RateLimiter {
+        let mut limits = HashMap::new();
+        limits.insert(
+            "claude".to_string(),
+            RateLimitConfig {
+                requests_per_minute: None,
+                tokens_per_minute: Some(tpm),
+                daily_budget_usd: None,
+            },
+        );
+        RateLimiter::new(&limits)
+    }
+
+    #[test]
+    fn test_tpm_pre_reservation_blocks_burst() {
+        let limiter = tpm_limiter(1000);
+        // Each admitted request pre-reserves 800 — so the budget depletes immediately and
+        // a third concurrent request is denied (the old non-consuming admission check let
+        // them all slip through at ~0 budget).
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Allowed)); // 1000→200
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Allowed)); // 200→-600
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Denied { .. })); // <1 → denied
+    }
+
+    #[test]
+    fn test_tpm_reconcile_refund_restores_budget() {
+        let limiter = tpm_limiter(1000);
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Allowed)); // 200
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Allowed)); // -600
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Denied { .. }));
+        // Reconcile one reservation down to 0 actual → refunds 800 (tokens -600 → 200).
+        limiter.reconcile_tokens("claude", 800, 0);
+        assert!(matches!(limiter.check("claude", 800), RateLimitResult::Allowed));
+    }
+
     #[test]
     fn test_tpm_default_fallback() {
         let mut limits = HashMap::new();
@@ -623,9 +702,9 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         // Unknown model uses default TPM bucket
-        limiter.report_tokens("unknown", 600);
+        limiter.reconcile_tokens("unknown", 0, 600);
         assert!(matches!(
-            limiter.check("unknown"),
+            limiter.check("unknown", 0),
             RateLimitResult::Denied { .. }
         ));
     }
@@ -644,8 +723,8 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         // Reporting 0 tokens should be a no-op
-        limiter.report_tokens("test", 0);
-        assert!(matches!(limiter.check("test"), RateLimitResult::Allowed));
+        limiter.reconcile_tokens("test", 0, 0);
+        assert!(matches!(limiter.check("test", 0), RateLimitResult::Allowed));
     }
 
     #[test]
@@ -662,12 +741,12 @@ mod tests {
         let limiter = RateLimiter::new(&limits);
 
         // RPM has plenty of room, but TPM gets exhausted
-        assert!(matches!(limiter.check("test"), RateLimitResult::Allowed));
-        limiter.report_tokens("test", 600);
+        assert!(matches!(limiter.check("test", 0), RateLimitResult::Allowed));
+        limiter.reconcile_tokens("test", 0, 600);
 
         // Should be denied by TPM even though RPM has capacity
         assert!(matches!(
-            limiter.check("test"),
+            limiter.check("test", 0),
             RateLimitResult::Denied { .. }
         ));
     }
@@ -677,7 +756,7 @@ mod tests {
     #[test]
     fn test_circuit_breaker_closed_by_default() {
         let cb = CircuitBreaker::new(3, 30, ["backend1"].into_iter());
-        assert!(cb.allow_request("backend1"));
+        assert!(cb.allow_request("backend1").0);
         assert_eq!(cb.state("backend1"), "closed");
     }
 
@@ -685,13 +764,13 @@ mod tests {
     fn test_circuit_breaker_opens_after_threshold() {
         let cb = CircuitBreaker::new(3, 30, ["backend1"].into_iter());
 
-        cb.record_failure("backend1");
-        assert!(cb.allow_request("backend1")); // 1 failure, still closed
-        cb.record_failure("backend1");
-        assert!(cb.allow_request("backend1")); // 2 failures, still closed
-        cb.record_failure("backend1");
+        cb.record_failure("backend1", None);
+        assert!(cb.allow_request("backend1").0); // 1 failure, still closed
+        cb.record_failure("backend1", None);
+        assert!(cb.allow_request("backend1").0); // 2 failures, still closed
+        cb.record_failure("backend1", None);
         // 3 failures = threshold → open
-        assert!(!cb.allow_request("backend1"));
+        assert!(!cb.allow_request("backend1").0);
         assert_eq!(cb.state("backend1"), "open");
     }
 
@@ -699,63 +778,87 @@ mod tests {
     fn test_circuit_breaker_success_resets() {
         let cb = CircuitBreaker::new(3, 30, ["backend1"].into_iter());
 
-        cb.record_failure("backend1");
-        cb.record_failure("backend1");
-        // 2 failures, then success resets
-        cb.record_success("backend1");
+        cb.record_failure("backend1", None);
+        cb.record_failure("backend1", None);
+        // 2 failures, then success resets the count (still closed)
+        cb.record_success("backend1", None);
         assert_eq!(cb.state("backend1"), "closed");
-        assert!(cb.allow_request("backend1"));
+        assert!(cb.allow_request("backend1").0);
 
         // Need 3 consecutive failures again
-        cb.record_failure("backend1");
-        cb.record_failure("backend1");
-        assert!(cb.allow_request("backend1")); // still closed (only 2)
+        cb.record_failure("backend1", None);
+        cb.record_failure("backend1", None);
+        assert!(cb.allow_request("backend1").0); // still closed (only 2)
     }
 
     #[test]
     fn test_circuit_breaker_half_open_recovery() {
         let cb = CircuitBreaker::new(2, 0, ["b1"].into_iter()); // 0 second recovery for testing
 
-        cb.record_failure("b1");
-        cb.record_failure("b1");
+        cb.record_failure("b1", None);
+        cb.record_failure("b1", None);
         assert_eq!(cb.state("b1"), "open");
 
         // With 0s recovery timeout, should immediately transition to half-open
-        assert!(cb.allow_request("b1")); // transitions to HalfOpen, allows probe
+        let (allowed, probe) = cb.allow_request("b1");
+        assert!(allowed);
+        assert!(probe.is_some());
         assert_eq!(cb.state("b1"), "half_open");
 
         // Second request while half-open should be denied
-        assert!(!cb.allow_request("b1"));
+        assert!(!cb.allow_request("b1").0);
 
-        // Probe success → closed
-        cb.record_success("b1");
+        // Probe success (with the probe token) → closed
+        cb.record_success("b1", probe);
         assert_eq!(cb.state("b1"), "closed");
-        assert!(cb.allow_request("b1"));
+        assert!(cb.allow_request("b1").0);
     }
 
     #[test]
     fn test_circuit_breaker_half_open_failure() {
         let cb = CircuitBreaker::new(2, 0, ["b1"].into_iter());
 
-        cb.record_failure("b1");
-        cb.record_failure("b1");
-        assert!(cb.allow_request("b1")); // → HalfOpen
+        cb.record_failure("b1", None);
+        cb.record_failure("b1", None);
+        let (allowed, probe) = cb.allow_request("b1"); // → HalfOpen
+        assert!(allowed);
 
-        // Probe fails → back to Open
-        cb.record_failure("b1");
+        // Probe fails (with the probe token) → back to Open
+        cb.record_failure("b1", probe);
         assert_eq!(cb.state("b1"), "open");
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_ignores_stale_success() {
+        // A request that started BEFORE the circuit opened (probe = None) must NOT close
+        // the circuit while it's half-open — only the probe's own outcome decides.
+        let cb = CircuitBreaker::new(2, 0, ["b1"].into_iter());
+
+        cb.record_failure("b1", None);
+        cb.record_failure("b1", None);
+        let (allowed, probe) = cb.allow_request("b1"); // → HalfOpen, probe issued
+        assert!(allowed);
+        assert_eq!(cb.state("b1"), "half_open");
+
+        // Stale (non-probe) success → ignored, stays half-open
+        cb.record_success("b1", None);
+        assert_eq!(cb.state("b1"), "half_open");
+
+        // The real probe success closes it
+        cb.record_success("b1", probe);
+        assert_eq!(cb.state("b1"), "closed");
     }
 
     #[test]
     fn test_circuit_breaker_independent_backends() {
         let cb = CircuitBreaker::new(2, 30, ["backend_a", "backend_b"].into_iter());
 
-        cb.record_failure("backend_a");
-        cb.record_failure("backend_a");
-        assert!(!cb.allow_request("backend_a")); // open
+        cb.record_failure("backend_a", None);
+        cb.record_failure("backend_a", None);
+        assert!(!cb.allow_request("backend_a").0); // open
 
         // backend_b should be unaffected
-        assert!(cb.allow_request("backend_b"));
+        assert!(cb.allow_request("backend_b").0);
         assert_eq!(cb.state("backend_b"), "closed");
     }
 }

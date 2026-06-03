@@ -3,11 +3,9 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 use crate::config::BackendConfig;
 use crate::error::ProxyError;
-use crate::rate_limiter::CircuitBreaker;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 use super::DEFAULT_MAX_TOKENS;
@@ -744,8 +742,7 @@ pub async fn chat_completions(
     backend: &BackendConfig,
     body: Value,
     stream: bool,
-    circuit_breaker: Arc<CircuitBreaker>,
-    backend_name: String,
+    ctx: super::StreamCtx,
 ) -> Result<Response, ProxyError> {
     let model = body
         .get("model")
@@ -810,8 +807,7 @@ pub async fn chat_completions(
 
     if stream {
         stream_anthropic_response(
-            resp, &model, include_usage, backend.effective_stream_chunk_timeout(),
-            circuit_breaker, backend_name,
+            resp, &model, include_usage, backend.effective_stream_chunk_timeout(), ctx,
         ).await
     } else {
         let anthropic_json: Value = resp.json().await.map_err(|e| {
@@ -858,8 +854,7 @@ async fn stream_anthropic_response(
     model: &str,
     include_usage: bool,
     chunk_timeout: std::time::Duration,
-    circuit_breaker: Arc<CircuitBreaker>,
-    backend_name: String,
+    ctx: super::StreamCtx,
 ) -> Result<Response, ProxyError> {
     let model = model.to_string();
     let byte_stream = resp.bytes_stream();
@@ -914,7 +909,13 @@ async fn stream_anthropic_response(
                             }
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
                             got_done = true;
-                            circuit_breaker.record_success(&backend_name);
+                            // Clean completion: record success + reconcile the TPM reservation
+                            // to the real usage tracked from message_start/message_delta.
+                            ctx.circuit_breaker.record_success(&ctx.backend_name, ctx.probe);
+                            let actual = state.input_tokens + state.output_tokens;
+                            if actual > 0 {
+                                ctx.rate_limiter.reconcile_tokens(&ctx.model_key, ctx.reserved_tokens, actual);
+                            }
                         } else if current_event_type == "error" {
                             // Mid-stream Anthropic error (e.g. overloaded_error) — surface it
                             // explicitly instead of swallowing it into a silent fallback.
@@ -935,7 +936,7 @@ async fn stream_anthropic_response(
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("data: {}\n\n", err_chunk)));
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
                             got_done = true;
-                            circuit_breaker.record_failure(&backend_name);
+                            ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                         } else if let Some(converted) = convert_sse_event(&mut state, &current_event_type, &data) {
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from(converted));
                         }
@@ -963,7 +964,7 @@ async fn stream_anthropic_response(
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
                     got_done = true;
                     // Chunk timeout is a backend health signal — count it as a failure.
-                    circuit_breaker.record_failure(&backend_name);
+                    ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                     break 'outer;
                 }
             };
@@ -998,7 +999,7 @@ async fn stream_anthropic_response(
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
                     got_done = true;
                     // Stream read error — count it against the backend.
-                    circuit_breaker.record_failure(&backend_name);
+                    ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                     break 'outer;
                 }
             }
@@ -1042,7 +1043,7 @@ async fn stream_anthropic_response(
             yield Ok::<_, std::io::Error>(bytes::Bytes::from(stop_chunk));
             yield Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n".to_string()));
             // Stream ended without message_stop — incomplete, count it as a failure.
-            circuit_breaker.record_failure(&backend_name);
+            ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
         }
     };
 

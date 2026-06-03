@@ -29,14 +29,15 @@ pub fn record_cb_outcome(
     _failed_attempts: u32,
     result: &Result<Response, ProxyError>,
     stream: bool,
+    probe: Option<u64>,
 ) {
     match result {
         // Non-streaming 2xx: success now. Streaming 2xx is intentionally NOT matched here —
         // it falls through to the neutral arm, and the stream generator records the outcome
         // at stream end (see doc comment).
-        Ok(resp) if resp.status().is_success() && !stream => cb.record_success(backend_name),
-        Ok(resp) if resp.status().is_server_error() => cb.record_failure(backend_name),
-        Err(_) => cb.record_failure(backend_name),
+        Ok(resp) if resp.status().is_success() && !stream => cb.record_success(backend_name, probe),
+        Ok(resp) if resp.status().is_server_error() => cb.record_failure(backend_name, probe),
+        Err(_) => cb.record_failure(backend_name, probe),
         _ => {} // 4xx, or streaming 2xx (deferred): neutral
     }
 }

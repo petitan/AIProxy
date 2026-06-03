@@ -4,11 +4,9 @@ use axum::response::Response;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::config::BackendConfig;
 use crate::error::ProxyError;
-use crate::rate_limiter::CircuitBreaker;
 
 /// Forward chat completions to Ollama using the **native** `/api/chat` endpoint.
 ///
@@ -25,8 +23,7 @@ pub async fn chat_completions(
     backend: &BackendConfig,
     body: Value,
     stream: bool,
-    circuit_breaker: Arc<CircuitBreaker>,
-    backend_name: String,
+    ctx: super::StreamCtx,
 ) -> Result<Response, ProxyError> {
     let url = format!("{}/api/chat", backend.base_url.trim_end_matches('/'));
     let native_body = openai_to_native(body, stream);
@@ -63,8 +60,7 @@ pub async fn chat_completions(
         Ok(native_stream_to_openai_sse(
             resp,
             backend.effective_stream_chunk_timeout(),
-            circuit_breaker,
-            backend_name,
+            ctx,
         ))
     } else {
         let bytes = resp.bytes().await?;
@@ -386,8 +382,7 @@ fn native_to_openai_response(native: &Value) -> Value {
 fn native_stream_to_openai_sse(
     upstream: reqwest::Response,
     chunk_timeout: std::time::Duration,
-    circuit_breaker: Arc<CircuitBreaker>,
-    backend_name: String,
+    ctx: super::StreamCtx,
 ) -> Response {
     let byte_stream = upstream.bytes_stream();
     let chat_id = format!("chatcmpl-{}", unix_timestamp());
@@ -467,8 +462,14 @@ fn native_stream_to_openai_sse(
                                 bytes::Bytes::from(format!("data: {}\n\n", chunk))
                             );
                             yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
-                            // Stream completed cleanly — the backend is healthy.
-                            circuit_breaker.record_success(&backend_name);
+                            // Stream completed cleanly — the backend is healthy. Record the
+                            // outcome and reconcile the TPM reservation to the real usage.
+                            ctx.circuit_breaker.record_success(&ctx.backend_name, ctx.probe);
+                            let actual = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0)
+                                + native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if actual > 0 {
+                                ctx.rate_limiter.reconcile_tokens(&ctx.model_key, ctx.reserved_tokens, actual);
+                            }
                             return;
                         }
 
@@ -537,12 +538,14 @@ fn native_stream_to_openai_sse(
                         )));
                     }
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
-                    // Stream broke before completion — count it against the backend.
-                    circuit_breaker.record_failure(&backend_name);
+                    // Stream broke before completion — count it against the backend. No TPM
+                    // reconcile: the conservative pre-reservation stays (safer than refunding).
+                    ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                     break;
                 }
                 Ok(None) => {
                     // Stream ended — process remaining buffer
+                    let mut final_usage: u64 = 0;
                     if !buffer.is_empty() {
                         let remaining = String::from_utf8_lossy(&buffer).trim().to_string();
                         if let Ok(native) = serde_json::from_str::<Value>(&remaining) {
@@ -572,6 +575,8 @@ fn native_stream_to_openai_sse(
                                 yield Ok::<_, std::io::Error>(
                                     bytes::Bytes::from(format!("data: {}\n\n", chunk))
                                 );
+                                final_usage = native.get("prompt_eval_count").and_then(|v| v.as_u64()).unwrap_or(0)
+                                    + native.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
                                 emitted_finish = true;
                             }
                         }
@@ -589,9 +594,12 @@ fn native_stream_to_openai_sse(
                     }
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
                     if emitted_finish {
-                        circuit_breaker.record_success(&backend_name);
+                        ctx.circuit_breaker.record_success(&ctx.backend_name, ctx.probe);
+                        if final_usage > 0 {
+                            ctx.rate_limiter.reconcile_tokens(&ctx.model_key, ctx.reserved_tokens, final_usage);
+                        }
                     } else {
-                        circuit_breaker.record_failure(&backend_name);
+                        ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                     }
                     break;
                 }
@@ -608,7 +616,7 @@ fn native_stream_to_openai_sse(
                     }
                     yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
                     // A chunk timeout is a backend health signal — count it as a failure.
-                    circuit_breaker.record_failure(&backend_name);
+                    ctx.circuit_breaker.record_failure(&ctx.backend_name, ctx.probe);
                     break;
                 }
             }

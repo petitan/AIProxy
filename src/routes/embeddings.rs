@@ -66,7 +66,8 @@ pub async fn create_embeddings(
     state.stats.increment_requests();
 
     // ── Circuit breaker check (BEFORE VRAM acquire) ──
-    if !state.circuit_breaker.allow_request(&backend_name) {
+    let (allowed, probe) = state.circuit_breaker.allow_request(&backend_name);
+    if !allowed {
         tracing::warn!(
             backend = %backend_name,
             model = %model_name,
@@ -78,6 +79,10 @@ pub async fn create_embeddings(
             backend_name
         )));
     }
+
+    // Embeddings have no max_tokens — reserve a minimal estimate at admission and reconcile
+    // to the real usage post-request (so a long-term TPM bypass can't accumulate).
+    let est_tokens: u64 = 1;
 
     // ── VRAM acquire (local backends only) ──
     let is_local = backend_config.backend_type == BackendType::Local;
@@ -107,8 +112,14 @@ pub async fn create_embeddings(
     }
 
     // ── Rate limit check (after CB + VRAM, so no phantom consumption) ──
-    if let RateLimitResult::Denied { retry_after_secs } = state.rate_limiter.check(model_key) {
-        // Demote VRAM if we already acquired
+    if let RateLimitResult::Denied { retry_after_secs } =
+        state.rate_limiter.check(model_key, est_tokens)
+    {
+        // Release a half-open probe (request never reached the backend) + VRAM. A None
+        // probe means Closed — a rate limit is not a backend failure, so don't record one.
+        if probe.is_some() {
+            state.circuit_breaker.record_failure(&backend_name, probe);
+        }
         if is_local && estimated_vram > 0 {
             state.vram.demote_to_idle(&model_name);
         }
@@ -135,13 +146,22 @@ pub async fn create_embeddings(
         retry_result.failed_attempts,
         &result,
         false, // embeddings never stream
+        probe,
     );
 
-    // ── Token usage + metrics reporting ──
-    if let Ok(ref resp) = result {
-        if let Some(usage) = resp.extensions().get::<TokenUsage>() {
-            state.rate_limiter.report_tokens(model_key, usage.total_tokens);
-            state.metrics.record_tokens(&model_name, usage.prompt_tokens, usage.completion_tokens);
+    // ── Reconcile the TPM reservation against the real usage ──
+    match &result {
+        Ok(resp) if resp.status().is_success() => {
+            if let Some(usage) = resp.extensions().get::<TokenUsage>() {
+                state
+                    .rate_limiter
+                    .reconcile_tokens(model_key, est_tokens, usage.total_tokens);
+                state.metrics.record_tokens(&model_name, usage.prompt_tokens, usage.completion_tokens);
+            }
+        }
+        _ => {
+            // Non-2xx or transport error → refund the reservation.
+            state.rate_limiter.reconcile_tokens(model_key, est_tokens, 0);
         }
     }
 

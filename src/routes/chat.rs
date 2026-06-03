@@ -144,7 +144,8 @@ pub async fn chat_completions(
     state.stats.increment_requests();
 
     // ── Circuit breaker check on ORIGINAL backend (BEFORE VRAM acquire to avoid wasted acquire+demote) ──
-    if !state.circuit_breaker.allow_request(&original_backend_name) {
+    let (allowed, probe_original) = state.circuit_breaker.allow_request(&original_backend_name);
+    if !allowed {
         tracing::warn!(
             backend = %original_backend_name,
             model = %model_name,
@@ -214,39 +215,33 @@ pub async fn chat_completions(
         }
     };
 
-    // ── Circuit breaker check on ACTIVE backend (only needed if fallback changed the backend) ──
-    if active.backend_name != original_backend_name
-        && !state.circuit_breaker.allow_request(&active.backend_name)
-    {
-        tracing::warn!(
-            backend = %active.backend_name,
-            model = %active.model_name,
-            "Circuit breaker open on fallback backend — rejecting request"
-        );
-        state.metrics.record_circuit_breaker_trip(&active.backend_name);
-        // Demote VRAM if we already acquired (fallback to local scenario)
-        if active.is_local && active.estimated_vram > 0 {
-            state.vram.demote_to_idle(&active.model_name);
+    // ── Circuit breaker check on ACTIVE backend + resolve the half-open probe token ──
+    // If a VRAM fallback changed the backend, the original backend's probe (if any) is
+    // abandoned — release it as a failure so that circuit isn't left stuck half-open.
+    let active_probe = if active.backend_name != original_backend_name {
+        if probe_original.is_some() {
+            state.circuit_breaker.record_failure(&original_backend_name, probe_original);
         }
-        return Err(ProxyError::BackendUnavailable(format!(
-            "Backend '{}' circuit breaker is open (too many consecutive failures)",
-            active.backend_name
-        )));
-    }
-
-    // ── Rate limit check (after CB + VRAM, so no phantom consumption on rejected requests) ──
-    if let RateLimitResult::Denied { retry_after_secs } = state.rate_limiter.check(&active.model_key) {
-        // Demote VRAM if we already acquired
-        if active.is_local && active.estimated_vram > 0 {
-            state.vram.demote_to_idle(&active.model_name);
+        let (allowed, probe) = state.circuit_breaker.allow_request(&active.backend_name);
+        if !allowed {
+            tracing::warn!(
+                backend = %active.backend_name,
+                model = %active.model_name,
+                "Circuit breaker open on fallback backend — rejecting request"
+            );
+            state.metrics.record_circuit_breaker_trip(&active.backend_name);
+            if active.is_local && active.estimated_vram > 0 {
+                state.vram.demote_to_idle(&active.model_name);
+            }
+            return Err(ProxyError::BackendUnavailable(format!(
+                "Backend '{}' circuit breaker is open (too many consecutive failures)",
+                active.backend_name
+            )));
         }
-        tracing::warn!(
-            model = %active.model_name,
-            retry_after_secs = retry_after_secs,
-            "Rate limit exceeded"
-        );
-        return Err(ProxyError::RateLimited { retry_after_secs });
-    }
+        probe
+    } else {
+        probe_original
+    };
 
     // ── Inject model defaults (extra_body) from the ACTIVE model config ──
     active.model_config.apply_extra_body(&mut body);
@@ -258,47 +253,87 @@ pub async fn chat_completions(
         }
     }
 
-    // ── Extract max_tokens before dispatch (for streaming TPM estimation) ──
+    // ── Estimate tokens for the TPM pre-reservation (max_tokens, or a default) ──
     let request_max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
+    // ── Rate limit check (after CB + VRAM; pre-reserves the estimate so concurrent
+    //    requests can't burst past the TPM budget — reconciled to real usage below) ──
+    if let RateLimitResult::Denied { retry_after_secs } =
+        state.rate_limiter.check(&active.model_key, request_max_tokens)
+    {
+        // Release a half-open probe (the request never reached the backend) + VRAM. A None
+        // probe means the circuit was Closed — a rate limit is not a backend failure, so
+        // we must NOT record one in that case.
+        if active_probe.is_some() {
+            state.circuit_breaker.record_failure(&active.backend_name, active_probe);
+        }
+        if active.is_local && active.estimated_vram > 0 {
+            state.vram.demote_to_idle(&active.model_name);
+        }
+        tracing::warn!(
+            model = %active.model_name,
+            retry_after_secs = retry_after_secs,
+            "Rate limit exceeded"
+        );
+        return Err(ProxyError::RateLimited { retry_after_secs });
+    }
+
     // ── Forward to backend ──
-    let retry_result = backends::dispatch_chat(
-        &state.client,
-        &active.backend_config,
-        body,
-        stream,
-        &state.circuit_breaker,
-        &active.backend_name,
-    ).await;
+    let stream_ctx = backends::StreamCtx {
+        circuit_breaker: state.circuit_breaker.clone(),
+        backend_name: active.backend_name.clone(),
+        probe: active_probe,
+        rate_limiter: state.rate_limiter.clone(),
+        model_key: active.model_key.clone(),
+        reserved_tokens: request_max_tokens,
+    };
+    let retry_result =
+        backends::dispatch_chat(&state.client, &active.backend_config, body, stream, &stream_ctx)
+            .await;
     let result = retry_result.result;
 
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    // ── Circuit breaker feedback (on the ACTIVE backend) ──
+    // ── Circuit breaker feedback (on the ACTIVE backend). For a streaming 2xx the outcome
+    //    is recorded by the stream generator at stream end (it carries the same probe). ──
     common::record_cb_outcome(
         &state.circuit_breaker,
         &active.backend_name,
         retry_result.failed_attempts,
         &result,
         stream,
+        active_probe,
     );
 
-    // ── Token usage + metrics reporting (using ACTIVE model key) ──
-    if let Ok(ref resp) = result {
-        if !stream {
-            // Non-streaming: exact token count from response extension
-            if let Some(usage) = resp.extensions().get::<TokenUsage>() {
-                state.rate_limiter.report_tokens(&active.model_key, usage.total_tokens);
-                state.metrics.record_tokens(&active.model_name, usage.prompt_tokens, usage.completion_tokens);
+    // ── Reconcile the TPM reservation against the real usage ──
+    match &result {
+        Ok(resp) if resp.status().is_success() => {
+            if !stream {
+                // Non-streaming: exact token count from the response extension.
+                if let Some(usage) = resp.extensions().get::<TokenUsage>() {
+                    state
+                        .rate_limiter
+                        .reconcile_tokens(&active.model_key, request_max_tokens, usage.total_tokens);
+                    state.metrics.record_tokens(
+                        &active.model_name,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    );
+                }
+                // else: usage unknown → leave the conservative reservation in place.
             }
-        } else {
-            // Streaming: pre-deduct estimated tokens from TPM to prevent bypass.
-            // Uses max_tokens from request (or default 4096) as conservative estimate.
-            state.rate_limiter.report_tokens(&active.model_key, request_max_tokens);
+            // Streaming 2xx: the generator reconciles at stream end.
+        }
+        _ => {
+            // Non-2xx or transport error → refund the full reservation (the request did
+            // not consume the estimated tokens).
+            state
+                .rate_limiter
+                .reconcile_tokens(&active.model_key, request_max_tokens, 0);
         }
     }
 
@@ -495,10 +530,17 @@ fn auto_select_remote_fallback(
     needed_mb: u64,
     available_mb: u64,
 ) -> Result<FallbackResult, ProxyError> {
-    for (key, model) in &state.config.models {
+    // Deterministic selection: iterate model keys in sorted order. `config.models` is a
+    // HashMap whose iteration order is randomized per process, so without sorting the
+    // auto-selected fallback model could differ across restarts — an unpredictable choice
+    // for anyone relying on default_fallback=remote.
+    let mut keys: Vec<&String> = state.config.models.keys().collect();
+    keys.sort();
+    for key in keys {
         if key == original_model_key {
             continue;
         }
+        let model = &state.config.models[key];
         if let Some(backend) = state.config.backends.get(&model.backend) {
             if backend.backend_type == BackendType::Remote {
                 tracing::warn!(

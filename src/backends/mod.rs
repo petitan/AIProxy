@@ -11,7 +11,21 @@ use serde_json::json;
 
 use crate::config::{ApiFormat, BackendConfig};
 use crate::error::ProxyError;
-use crate::rate_limiter::CircuitBreaker;
+use crate::rate_limiter::{CircuitBreaker, RateLimiter};
+
+/// Context threaded into a streaming response so the generator can record the request's
+/// outcome at stream end — which is AFTER the handler has returned. Carries the circuit
+/// breaker (+ half-open probe token) for CB feedback and the rate limiter (+ model key and
+/// pre-reserved token estimate) for TPM reconciliation against the real usage.
+#[derive(Clone)]
+pub struct StreamCtx {
+    pub circuit_breaker: Arc<CircuitBreaker>,
+    pub backend_name: String,
+    pub probe: Option<u64>,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub model_key: String,
+    pub reserved_tokens: u64,
+}
 
 /// Default `max_tokens` when a request omits it — shared across backends and the
 /// streaming TPM estimator so the value never diverges between call sites.
@@ -55,23 +69,21 @@ pub async fn dispatch_chat(
     backend: &BackendConfig,
     body: serde_json::Value,
     stream: bool,
-    circuit_breaker: &Arc<CircuitBreaker>,
-    backend_name: &str,
+    ctx: &StreamCtx,
 ) -> RetryResult {
     let max_retries = if stream { 0 } else { backend.effective_max_retries() };
 
     with_retry(max_retries, &backend.base_url, || async {
         match backend.format {
-            ApiFormat::OpenAI => ollama::chat_completions(
-                client, backend, body.clone(), stream,
-                circuit_breaker.clone(), backend_name.to_string(),
-            ).await,
-            ApiFormat::Anthropic => anthropic::chat_completions(
-                client, backend, body.clone(), stream,
-                circuit_breaker.clone(), backend_name.to_string(),
-            ).await,
+            ApiFormat::OpenAI => {
+                ollama::chat_completions(client, backend, body.clone(), stream, ctx.clone()).await
+            }
+            ApiFormat::Anthropic => {
+                anthropic::chat_completions(client, backend, body.clone(), stream, ctx.clone()).await
+            }
         }
-    }).await
+    })
+    .await
 }
 
 /// Dispatch an embeddings request (only OpenAI-compatible backends).
